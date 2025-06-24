@@ -1,15 +1,13 @@
+import time
 import logging
 import threading
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from datetime import datetime
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType
 from longport.openapi import PushQuote, SubType, TopicType, OrderSide, TimeInForceType
-from flask import Flask
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
 
 config = Config.from_env()
 quote_ctx = QuoteContext(config)
@@ -107,27 +105,31 @@ def on_quote(symbol: str, event: PushQuote):
         if symbol == position_symbol and event.last_done > position_stop_loss_10_price:
             set_position_risk_to_open()
 
+processed_order_ids = set()
 def on_order_changed(event: PushOrderChanged):
     with position_lock:
+        global processed_order_ids
+        logger.info(f"on_order_changed: {event.__dict__}")
+        if event.order_id in processed_order_ids:
+            logger.info(f"订单 {event.order_id} 已处理，跳过")
+            return
         if str(event.side) == "OrderSide.Buy" and str(event.status) == "OrderStatus.Filled":
             if position_symbol is None:
                 set_position_info(event)
                 set_position_risk()
+                processed_order_ids.add(event.order_id)
 
                 logger.info("开始监听股票涨幅")
                 quote_ctx.subscribe([event.symbol], [SubType.Quote], is_first_push = True)
         elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
             if position_symbol is not None:
                 set_position_info(event, sell=True)
+                processed_order_ids.add(event.order_id)
 
                 logger.info("取消监听股票涨幅")
                 quote_ctx.unsubscribe([event.symbol], [SubType.Quote])
         else:
             pass
-
-@app.route("/")
-def health():
-    return "ok"
 
 quote_ctx.set_on_quote(on_quote)
 
@@ -135,4 +137,6 @@ trade_ctx.set_on_order_changed(on_order_changed)
 trade_ctx.subscribe([TopicType.Private])
 
 logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-app.run(host='0.0.0.0', port=80, debug=True)
+
+while True:
+    time.sleep(60)

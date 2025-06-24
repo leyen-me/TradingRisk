@@ -1,4 +1,5 @@
 import logging
+import threading
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from datetime import datetime
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType
@@ -23,6 +24,7 @@ position_quantity = Decimal('0')            # 开仓数量
 
 stop_loss_order_id = None                   # 止损订单ID
 stop_loss_order_update = False              # 是否上调过止损线
+position_lock = threading.Lock()
 
 def set_position_info(event: PushOrderChanged, sell: bool = False):
     """
@@ -88,37 +90,40 @@ def set_position_risk_to_open():
         stop_loss_order_update = True
         trade_ctx.replace_order(
             order_id = stop_loss_order_id,
+            quantity = position_quantity,
             trigger_price = position_price,
         )
     except Exception as e:
         logger.warning(f"修改订单失败: {e}")
 
 def on_quote(symbol: str, event: PushQuote):
-    if position_symbol is None:
-        return
-    if stop_loss_order_id is None:
-        return
-    if stop_loss_order_update == True:
-        return
-    if symbol == position_symbol and event.last_done > position_stop_loss_10_price:
-        set_position_risk_to_open()
+    with position_lock:
+        if position_symbol is None:
+            return
+        if stop_loss_order_id is None:
+            return
+        if stop_loss_order_update == True:
+            return
+        if symbol == position_symbol and event.last_done > position_stop_loss_10_price:
+            set_position_risk_to_open()
 
 def on_order_changed(event: PushOrderChanged):
-    if str(event.side) == "OrderSide.Buy" and str(event.status) == "OrderStatus.Filled":
-        if position_symbol is None:
-            set_position_info(event)
-            set_position_risk()
+    with position_lock:
+        if str(event.side) == "OrderSide.Buy" and str(event.status) == "OrderStatus.Filled":
+            if position_symbol is None:
+                set_position_info(event)
+                set_position_risk()
 
-            logger.info("开始监听股票涨幅")
-            quote_ctx.subscribe([event.symbol], [SubType.Quote], is_first_push = True)
-    elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
-        if position_symbol is not None:
-            set_position_info(event, sell=True)
+                logger.info("开始监听股票涨幅")
+                quote_ctx.subscribe([event.symbol], [SubType.Quote], is_first_push = True)
+        elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
+            if position_symbol is not None:
+                set_position_info(event, sell=True)
 
-            logger.info("取消监听股票涨幅")
-            quote_ctx.unsubscribe([event.symbol], [SubType.Quote])
-    else:
-        pass
+                logger.info("取消监听股票涨幅")
+                quote_ctx.unsubscribe([event.symbol], [SubType.Quote])
+        else:
+            pass
 
 @app.route("/")
 def health():

@@ -1,8 +1,12 @@
+import logging
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from datetime import datetime
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType
 from longport.openapi import PushQuote, SubType, TopicType, OrderSide, TimeInForceType
 from flask import Flask
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -36,7 +40,7 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         position_take_profit_price = Decimal('0')
         stop_loss_order_id = None
         stop_loss_order_update = False
-        print("重置订单信息成功")
+        logger.info("重置订单信息成功")
     else:
         position_symbol = event.symbol
         position_price = event.submitted_price
@@ -44,7 +48,7 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         position_stop_loss_price = event.submitted_price * Decimal('0.8').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
         position_stop_loss_10_price = event.submitted_price * Decimal('1.1').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
         position_take_profit_price = event.submitted_price * Decimal('1.2').quantize(Decimal('0.01'), rounding=ROUND_UP)
-        print("添加下单信息成功")
+        logger.info("添加下单信息成功")
 
 def set_position_risk():
     global stop_loss_order_id
@@ -63,7 +67,7 @@ def set_position_risk():
         )
         stop_loss_order_id = stop_loss_order.order_id
     except Exception as e:
-        print(f"增加止损订单失败: {e}")
+        logger.warning(f"增加止损订单失败: {e}")
 
     try:
         trade_ctx.submit_order(
@@ -76,7 +80,7 @@ def set_position_risk():
             remark="止盈",
         )
     except Exception as e:
-        print(f"增加止盈订单失败: {e}")
+        logger.warning(f"增加止盈订单失败: {e}")
 
 def set_position_risk_to_open():
     global stop_loss_order_update
@@ -87,7 +91,7 @@ def set_position_risk_to_open():
             trigger_price = position_price,
         )
     except Exception as e:
-        print(f"修改订单失败: {e}")
+        logger.warning(f"修改订单失败: {e}")
 
 def on_quote(symbol: str, event: PushQuote):
     if position_symbol is None:
@@ -105,13 +109,13 @@ def on_order_changed(event: PushOrderChanged):
             set_position_info(event)
             set_position_risk()
 
-            print("开始监听股票涨幅")
+            logger.info("开始监听股票涨幅")
             quote_ctx.subscribe([event.symbol], [SubType.Quote], is_first_push = True)
     elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
         if position_symbol is not None:
             set_position_info(event, sell=True)
 
-            print("取消监听股票涨幅")
+            logger.info("取消监听股票涨幅")
             quote_ctx.unsubscribe([event.symbol], [SubType.Quote])
     else:
         pass
@@ -125,5 +129,5 @@ quote_ctx.set_on_quote(on_quote)
 trade_ctx.set_on_order_changed(on_order_changed)
 trade_ctx.subscribe([TopicType.Private])
 
-print("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 app.run(host='0.0.0.0', port=80, debug=True)

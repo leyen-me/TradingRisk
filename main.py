@@ -1,10 +1,10 @@
+from datetime import datetime
 import time
 import logging
 import threading
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
-from datetime import datetime
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType
-from longport.openapi import PushQuote, SubType, TopicType, OrderSide, TimeInForceType
+from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -16,47 +16,59 @@ trade_ctx = TradeContext(config)
 position_symbol = None                      # 开仓标的
 position_price = Decimal('0')               # 开仓价格
 position_stop_loss_price = Decimal('0')     # 止损平仓价格
-position_stop_loss_10_price = Decimal('0')  # 10%
 position_take_profit_price = Decimal('0')   # 止盈平仓价格
 position_quantity = Decimal('0')            # 开仓数量
 
-stop_loss_order_id = None                   # 止损订单ID
-stop_loss_order_update = False              # 是否上调过止损线
 position_lock = threading.Lock()
+processed_order_ids = set()
+
+
+def get_min_20_price():
+    lowest = None
+    try:
+        arr = []
+        resp = quote_ctx.candlesticks(position_symbol, Period.Min_2, 20, AdjustType.NoAdjust, TradeSessions.Intraday)
+        for item in resp:
+            arr.append(item.low)
+        lowest = min([item.low for item in resp])
+        logging.info(f"查询到最近20根K线的最低价:{str(lowest)}")
+    except Exception as e:
+        logger.warning(f"查询最低价失败: {e}")
+    return lowest
 
 def set_position_info(event: PushOrderChanged, sell: bool = False):
     """
     设置开仓信息
     """
     global position_symbol, position_price, position_quantity
-    global position_stop_loss_price, position_take_profit_price, position_stop_loss_10_price
-    global stop_loss_order_id, stop_loss_order_update
+    global position_stop_loss_price, position_take_profit_price
     if sell:
         position_symbol = None
         position_price = Decimal('0')
         position_quantity = Decimal('0')
         position_stop_loss_price = Decimal('0')
-        position_stop_loss_10_price = Decimal('0')
         position_take_profit_price = Decimal('0')
-        stop_loss_order_id = None
-        stop_loss_order_update = False
         logger.info("重置订单信息成功")
     else:
         position_symbol = event.symbol
         position_price = event.submitted_price
         position_quantity = event.executed_quantity
-        position_stop_loss_price = event.submitted_price * Decimal('0.8').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-        position_stop_loss_10_price = event.submitted_price * Decimal('1.1').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-        position_take_profit_price = event.submitted_price * Decimal('1.2').quantize(Decimal('0.01'), rounding=ROUND_UP)
+
+        price = get_min_20_price()
+        if price is None:
+            position_stop_loss_price = event.submitted_price * Decimal('0.9').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        else:
+            position_stop_loss_price = price
+        
+        position_take_profit_price = event.submitted_price * Decimal('1.1').quantize(Decimal('0.01'), rounding=ROUND_UP)
         logger.info("添加下单信息成功")
 
 def set_position_risk():
-    global stop_loss_order_id
     """
     设置止盈止损，风险回报比为1:1。
     """
     try:
-        stop_loss_order = trade_ctx.submit_order(
+        trade_ctx.submit_order(
             position_symbol,
             OrderType.MIT,
             OrderSide.Sell,
@@ -65,7 +77,6 @@ def set_position_risk():
             trigger_price=position_stop_loss_price,
             remark="止损",
         )
-        stop_loss_order_id = stop_loss_order.order_id
     except Exception as e:
         logger.warning(f"增加止损订单失败: {e}")
 
@@ -82,30 +93,7 @@ def set_position_risk():
     except Exception as e:
         logger.warning(f"增加止盈订单失败: {e}")
 
-def set_position_risk_to_open():
-    global stop_loss_order_update
-    try:
-        stop_loss_order_update = True
-        trade_ctx.replace_order(
-            order_id = stop_loss_order_id,
-            quantity = position_quantity,
-            trigger_price = position_price,
-        )
-    except Exception as e:
-        logger.warning(f"修改订单失败: {e}")
 
-def on_quote(symbol: str, event: PushQuote):
-    with position_lock:
-        if position_symbol is None:
-            return
-        if stop_loss_order_id is None:
-            return
-        if stop_loss_order_update == True:
-            return
-        if symbol == position_symbol and event.last_done > position_stop_loss_10_price:
-            set_position_risk_to_open()
-
-processed_order_ids = set()
 def on_order_changed(event: PushOrderChanged):
     with position_lock:
         global processed_order_ids
@@ -115,23 +103,17 @@ def on_order_changed(event: PushOrderChanged):
             return
         if str(event.side) == "OrderSide.Buy" and str(event.status) == "OrderStatus.Filled":
             if position_symbol is None:
+                logger.info(f"发现买入订单:{event.symbol}")
                 set_position_info(event)
                 set_position_risk()
                 processed_order_ids.add(event.order_id)
-
-                logger.info("开始监听股票涨幅")
-                quote_ctx.subscribe([event.symbol], [SubType.Quote], is_first_push = True)
         elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
             if position_symbol is not None:
+                logger.info(f"发现卖出订单:{position_symbol}")
                 set_position_info(event, sell=True)
                 processed_order_ids.add(event.order_id)
-
-                logger.info("取消监听股票涨幅")
-                quote_ctx.unsubscribe([event.symbol], [SubType.Quote])
         else:
             pass
-
-quote_ctx.set_on_quote(on_quote)
 
 trade_ctx.set_on_order_changed(on_order_changed)
 trade_ctx.subscribe([TopicType.Private])

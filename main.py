@@ -1,9 +1,11 @@
-from datetime import datetime
 import time
 import logging
 import threading
+from datetime import datetime
+from collections import OrderedDict
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
-from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType
+
+from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
 from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -13,6 +15,7 @@ config = Config.from_env()
 quote_ctx = QuoteContext(config)
 trade_ctx = TradeContext(config)
 
+
 position_symbol = None                      # 开仓标的
 position_price = Decimal('0')               # 开仓价格
 position_stop_loss_price = Decimal('0')     # 止损平仓价格
@@ -20,7 +23,9 @@ position_take_profit_price = Decimal('0')   # 止盈平仓价格
 position_quantity = Decimal('0')            # 开仓数量
 
 position_lock = threading.Lock()
-processed_order_ids = set()
+
+MAX_PROCESSED_ORDERS = 1000
+processed_order_ids = OrderedDict()
 
 
 def get_min_20_price():
@@ -97,21 +102,25 @@ def set_position_risk():
 def on_order_changed(event: PushOrderChanged):
     with position_lock:
         global processed_order_ids
-        logger.info(f"on_order_changed: {event.__dict__}")
+        logger.info(f"on_order_changed: {event.order_id}")
         if event.order_id in processed_order_ids:
             logger.info(f"订单 {event.order_id} 已处理，跳过")
             return
-        if str(event.side) == "OrderSide.Buy" and str(event.status) == "OrderStatus.Filled":
+        
+        # processed_order_ids 这个 set 会随着订单数量的增加而无限增长，最终可能导致内存泄漏或占用过多内存。
+        processed_order_ids[event.order_id] = None
+        if len(processed_order_ids) > MAX_PROCESSED_ORDERS:
+            processed_order_ids.popitem(last=False)
+        
+        if event.side == OrderSide.Buy and event.status == OrderStatus.Filled:
             if position_symbol is None:
                 logger.info(f"发现买入订单:{event.symbol}")
                 set_position_info(event)
                 set_position_risk()
-                processed_order_ids.add(event.order_id)
-        elif str(event.side) == "OrderSide.Sell" and str(event.status) == "OrderStatus.Filled":
+        elif event.side == OrderSide.Sell and event.status == OrderStatus.Filled:
             if position_symbol is not None:
                 logger.info(f"发现卖出订单:{position_symbol}")
                 set_position_info(event, sell=True)
-                processed_order_ids.add(event.order_id)
         else:
             pass
 
@@ -120,5 +129,14 @@ trade_ctx.subscribe([TopicType.Private])
 
 logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-while True:
-    time.sleep(60)
+try:
+    while True:
+        time.sleep(60)
+except KeyboardInterrupt:
+    logger.info("检测到退出信号，正在关闭...")
+finally:
+    try:
+        trade_ctx.unsubscribe([TopicType.Private])
+    except Exception as e:
+        logger.warning(f"取消交易订阅失败: {e}")
+    logger.info("程序已退出。")

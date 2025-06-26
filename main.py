@@ -58,14 +58,10 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         position_symbol = event.symbol
         position_price = event.submitted_price
         position_quantity = event.executed_quantity
-
-        price = get_min_20_price()
-        if price is None:
-            position_stop_loss_price = event.submitted_price * Decimal('0.9').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-        else:
-            position_stop_loss_price = price
-        
-        position_take_profit_price = event.submitted_price * Decimal('1.1').quantize(Decimal('0.01'), rounding=ROUND_UP)
+        # 防止黑天鹅事件
+        position_stop_loss_price = event.submitted_price * Decimal('0.8').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        # 每笔交易2.5%止盈
+        position_take_profit_price = event.submitted_price * Decimal('1.025').quantize(Decimal('0.01'), rounding=ROUND_UP)
         logger.info("添加下单信息成功")
 
 def set_position_risk():

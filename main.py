@@ -3,7 +3,7 @@ import logging
 import threading
 from datetime import datetime
 from collections import OrderedDict
-from decimal import ROUND_DOWN, ROUND_UP, Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
 from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType
@@ -20,6 +20,11 @@ position_symbol = None                      # 开仓标的
 position_price = Decimal('0')               # 开仓价格
 position_stop_loss_price = Decimal('0')     # 止损平仓价格
 position_take_profit_price = Decimal('0')   # 止盈平仓价格
+
+# 订单ID
+stop_order_id = None
+take_profit_order_id = None
+
 position_quantity = Decimal('0')            # 开仓数量
 
 position_lock = threading.Lock()
@@ -48,28 +53,37 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
     global position_symbol, position_price, position_quantity
     global position_stop_loss_price, position_take_profit_price
     if sell:
+        logger.info("================开始重置订单信息================")
         position_symbol = None
         position_price = Decimal('0')
         position_quantity = Decimal('0')
         position_stop_loss_price = Decimal('0')
         position_take_profit_price = Decimal('0')
-        logger.info("重置订单信息成功")
+        logger.info("================重置订单信息成功================")
     else:
+        logger.info("================开始添加下单信息================")
         position_symbol = event.symbol
         position_price = event.submitted_price
         position_quantity = event.executed_quantity
+
+        print("原始价格:" + str(position_price))
         # 防止黑天鹅事件
-        position_stop_loss_price = event.submitted_price * Decimal('0.8').quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        position_stop_loss_price = (event.submitted_price * Decimal('0.7')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        print("止损价格:" + str(position_stop_loss_price))
+
         # 每笔交易2.5%止盈
-        position_take_profit_price = event.submitted_price * Decimal('1.025').quantize(Decimal('0.01'), rounding=ROUND_UP)
-        logger.info("添加下单信息成功")
+        position_take_profit_price = (event.submitted_price * Decimal('1.025')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        print("止盈价格:" + str(position_take_profit_price))
+
+        logger.info("================添加下单信息成功================")
 
 def set_position_risk():
     """
-    设置止盈止损，风险回报比为1:1。
+    设置止盈止损
     """
+    global stop_order_id, take_profit_order_id
     try:
-        trade_ctx.submit_order(
+        stop_order = trade_ctx.submit_order(
             position_symbol,
             OrderType.MIT,
             OrderSide.Sell,
@@ -78,11 +92,12 @@ def set_position_risk():
             trigger_price=position_stop_loss_price,
             remark="止损",
         )
+        stop_order_id = stop_order.order_id
     except Exception as e:
         logger.warning(f"增加止损订单失败: {e}")
 
     try:
-        trade_ctx.submit_order(
+        take_profit_order = trade_ctx.submit_order(
             position_symbol,
             OrderType.MIT,
             OrderSide.Sell,
@@ -91,34 +106,58 @@ def set_position_risk():
             trigger_price=position_take_profit_price,
             remark="止盈",
         )
+        take_profit_order_id = take_profit_order.order_id
     except Exception as e:
         logger.warning(f"增加止盈订单失败: {e}")
 
 
+def cancel_position_risk_order():
+    """
+    自动撤销止损止盈的监听
+    """
+    global stop_order_id, take_profit_order_id
+    try:
+        trade_ctx.cancel_order(stop_order_id)
+        logger.info("自动撤销止损订单成功")
+    except Exception as e:
+        logger.warning(f"撤销止损监听失败: {e}")
+    finally:
+        stop_order_id = None
+
+    try:
+        trade_ctx.cancel_order(take_profit_order_id)
+        logger.info("自动撤销止盈订单成功")
+    except Exception as e:
+        logger.warning(f"撤销止盈监听失败: {e}")
+    finally:
+        take_profit_order_id = None
+
 def on_order_changed(event: PushOrderChanged):
     with position_lock:
-        global processed_order_ids
-        logger.info(f"on_order_changed: {event.order_id}")
-        if event.order_id in processed_order_ids:
-            logger.info(f"订单 {event.order_id} 已处理，跳过")
-            return
-        
-        # processed_order_ids 这个 set 会随着订单数量的增加而无限增长，最终可能导致内存泄漏或占用过多内存。
-        processed_order_ids[event.order_id] = None
-        if len(processed_order_ids) > MAX_PROCESSED_ORDERS:
-            processed_order_ids.popitem(last=False)
-        
-        if event.side == OrderSide.Buy and event.status == OrderStatus.Filled:
-            if position_symbol is None:
-                logger.info(f"发现买入订单:{event.symbol}")
-                set_position_info(event)
-                set_position_risk()
-        elif event.side == OrderSide.Sell and event.status == OrderStatus.Filled:
-            if position_symbol is not None:
-                logger.info(f"发现卖出订单:{position_symbol}")
-                set_position_info(event, sell=True)
-        else:
-            pass
+        if event.status == OrderStatus.Filled:
+            global processed_order_ids
+            logger.info(f"on_order_changed: {event.order_id}")
+            if event.order_id in processed_order_ids:
+                logger.info(f"订单 {event.order_id} 已处理，跳过")
+                return
+            
+            # processed_order_ids 这个 set 会随着订单数量的增加而无限增长，最终可能导致内存泄漏或占用过多内存。
+            processed_order_ids[event.order_id] = None
+            if len(processed_order_ids) > MAX_PROCESSED_ORDERS:
+                processed_order_ids.popitem(last=False)
+
+            if event.side == OrderSide.Buy:
+                if position_symbol is None:
+                    logger.info(f"发现买入订单:{event.symbol}")
+                    set_position_info(event)
+                    set_position_risk()
+            elif event.side == OrderSide.Sell:
+                if position_symbol is not None:
+                    logger.info(f"发现卖出订单:{position_symbol}")
+                    set_position_info(event, sell=True)
+                    cancel_position_risk_order()
+            else:
+                pass
 
 trade_ctx.set_on_order_changed(on_order_changed)
 trade_ctx.subscribe([TopicType.Private])

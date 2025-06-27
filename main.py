@@ -31,8 +31,8 @@ CONFIG = Config.from_env()
 # ====== 配置参数区 ======
 OPEN_COOLDOWN_MINUTES = 10 # 冷却时间，单位分钟
 OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60  # 换算成秒
-TAKE_PROFIT_RATIO = Decimal('1.05')  # 止盈比例（2.5%）
-STOP_LOSS_RATIO = Decimal('0.95') # 止损比例（0.8倍）
+TAKE_PROFIT_RATIO = Decimal('1.05')  # 止盈比例（+5%）
+STOP_LOSS_RATIO = Decimal('0.95') # 止损比例（-5%）
 PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
 MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
 
@@ -357,7 +357,8 @@ def validate_active_time(active_time: datetime = None):
     if not open_time or not close_time:
         raise Exception("当前不在美股盘中时间段内，拒绝开仓")
 
-    allow_start = open_time + timedelta(minutes=30)  # 22:00
+    # allow_start = open_time + timedelta(minutes=30)  # 22:00
+    allow_start = open_time  # 21:30
     allow_end = close_time - timedelta(minutes=30)   # 03:30
 
     if not (allow_start <= dt <= allow_end):
@@ -400,7 +401,9 @@ def webhook():
         logger.info(f"收到 TradingView 信号: {webhook_data}")
         validate_auth(webhook_data)
         ticker, action_enum = parse_webhook_data(webhook_data)
-        validate_position_time_range()
+
+        # 冷静期代码移动到策略中了，这里暂时注释
+        # validate_position_time_range()
         validate_active_time()
         trade_option(ticker, action_enum)
 

@@ -1,39 +1,140 @@
-//@version=6
-indicator('MACD Volume Strategy (BBO + MACD State, Reversal Type) - Indicator Version', overlay = true)
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ 
+// © RanaAlgo
 
-src = close
+//@version=5
+indicator("RSI_MFI", overlay=false, shorttitle="RSI_MFI", precision=2, max_labels_count=500)
 
-// === Volume Oscillator ===
-shortlen = input.int(6, minval = 1, title = 'Volume Short Length')
-longlen = input.int(12, minval = 1, title = 'Volume Long Length')
-shortVol = ta.ema(volume, shortlen)
-longVol = ta.ema(volume, longlen)
-osc = 100 * (shortVol - longVol) / longVol
+// ========== 输入设置 ==========
+// ---- RSI 设置 ----
+rsiLength = input(14, title="RSI周期", group="RSI设置")
+oversold = input(24, title="超卖线", group="RSI设置")
+overbought = input(75, title="超买线", group="RSI设置")
+src = input(close, title="计算源", group="RSI设置")
 
-// === MACD Calculation ===
-fast_length = input(11, title = 'MACD Fast Length')
-slow_length = input(21, title = 'MACD Slow Length')
-signal_length = input.int(10, title = 'Signal Smoothing')
-sma_source = input.string('SMA', title = 'Oscillator MA Type', options = ['SMA', 'EMA'])
-sma_signal = input.string('SMA', title = 'Signal Line MA Type', options = ['SMA', 'EMA'])
+// ---- MFI云 设置 ----
+mfiLength = input(20, title="MFI周期", group="MFI云设置")
+fastMfiEma = input(5, title="快速EMA周期", group="MFI云设置")
+slowMfiEma = input(13, title="慢速EMA周期", group="MFI云设置")
+cloudOpacity = input.int(40, title="云层透明度", minval=10, maxval=90, group="MFI云设置")
 
-fast_ma = sma_source == 'SMA' ? ta.sma(src, fast_length) : ta.ema(src, fast_length)
-slow_ma = sma_source == 'SMA' ? ta.sma(src, slow_length) : ta.ema(src, slow_length)
-macd = fast_ma - slow_ma
-signal = sma_signal == 'SMA' ? ta.sma(macd, signal_length) : ta.ema(macd, signal_length)
+// ---- 信号配置 ----
+requireVolume = input(false, title="需要成交量确认", group="信号设置")
+trendConfirmation = input(false, title="需要趋势确认", group="信号设置")
+minPeakStrength = input.int(2, title="最小峰谷强度", minval=1, maxval=5, group="信号设置")
 
-// === MACD State Check ===
-macdAboveSignal = macd > signal
-macdBelowSignal = macd < signal
+// ---- 可视化设置 ----
+showSignals = input(true, "显示买卖信号", group="可视化设置")
+showZones = input(true, title="显示超买/超卖区", group="可视化设置")
+showMiddleLine = input(true, title="显示中线", group="可视化设置")
+showMfiCloud = input(true, title="显示MFI云", group="可视化设置")
 
-// === BBO Arrow Signals ===
-bboBuyArrow = ta.crossover(macd, 0) and osc > 0
-bboSellArrow = ta.crossunder(macd, 0) and osc > 0
+// ========== 计算模块 ==========
+// ---- RSI计算 ----
+rsi = ta.rsi(src, rsiLength)
+smoothedRSI = ta.ema(rsi, 3) // 对RSI进行平滑处理
 
-// === Entry Signals ===
-longSignal = bboBuyArrow and macdAboveSignal
-shortSignal = bboSellArrow and macdBelowSignal
+// ---- MFI计算 ----
+mfi = ta.mfi(close, mfiLength) // 计算MFI指标
+fastMfi = ta.ema(mfi, fastMfiEma) // 快速EMA
+slowMfi = ta.ema(mfi, slowMfiEma) // 慢速EMA
 
-// === Plot Buy/Sell Arrows on Chart ===
-plotshape(longSignal, title="Buy Signal", location=location.belowbar, color=color.green, style=shape.triangleup, size=size.small)
-plotshape(shortSignal, title="Sell Signal", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small)
+// ---- MFI云条件 ----
+bullishCloud = fastMfi > slowMfi // 多头排列
+bearishCloud = fastMfi < slowMfi // 空头排列
+
+// ---- 峰谷检测 ----
+isPeak = ta.falling(rsi, minPeakStrength) and rsi >= overbought // 检测顶部
+isDip = ta.rising(rsi, minPeakStrength) and rsi <= oversold // 检测底部
+
+// ---- 成交量过滤器 ----
+volumeOk = not requireVolume or volume > ta.sma(volume, 20) // 是否满足成交量条件
+
+// ---- 趋势过滤器 ----
+trendOkBuy = not trendConfirmation or close > ta.ema(close, 20) // 上升趋势才允许做多
+trendOkSell = not trendConfirmation or close < ta.ema(close, 20) // 下跌趋势才允许做空
+
+// ---- 交叉条件 ----
+crossOverSold = ta.crossover(rsi, oversold) // RSI从下向上穿过超卖线
+crossUnderBought = ta.crossunder(rsi, overbought) // RSI从上向下穿过超买线
+
+// ========== 信号生成模块 ==========
+// ---- 记录最后一个信号 ----
+var string lastSignal = "无"
+var color lastSignalColor = color.gray
+
+// ---- 限制信号频率：冷却期30根K线 ----
+var int lastSignalBar = na
+bool cooldownOk = na(lastSignalBar) or (bar_index - lastSignalBar >= 30) // 冷却期内禁止重复信号
+
+// ---- 新增规则：收盘阳线涨幅或成交量过大时不发信号 ----
+priceChange = math.abs(close / close[1] - 1) * 100 // 百分比涨跌幅
+volChange = volume / volume[1] // 成交量变化倍数
+
+largeBullCandle = close > open and priceChange > 1 // 阳线涨幅超过1%
+largeBearCandle = open > close and priceChange > 1 // 阴线跌幅超过1%
+largeVol = volChange > 3 // 成交量放大超过3倍
+
+buySignal = showSignals and cooldownOk and ((isDip and volumeOk and trendOkBuy and (ta.change(rsi, 1) > 0 and ta.change(rsi, 2) > 0)) or (not requireVolume and not trendConfirmation and crossOverSold)) and not largeBullCandle and not largeVol // 新增排除条件
+sellSignal = showSignals and cooldownOk and ((isPeak and volumeOk and trendOkSell and (ta.change(rsi, 1) < 0 and ta.change(rsi, 2) < 0)) or (not requireVolume and not trendConfirmation and crossUnderBought)) and not largeBearCandle and not largeVol // 新增排除条件
+
+// ---- 更新最后信号时间 ----
+if buySignal or sellSignal
+    lastSignalBar := bar_index
+
+if buySignal
+    lastSignal := "买入"
+    lastSignalColor := color.green
+else if sellSignal
+    lastSignal := "卖出"
+    lastSignalColor := color.red
+
+// ========== 可视化模块 ==========
+// ---- 动态RSI颜色 ----
+rsiColor = rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.new(#2962FF, 0)
+plot(rsi, title="RSI", color=rsiColor, linewidth=2)
+
+// ---- MFI云填充 ----
+fillColor = bullishCloud ? color.new(color.green, 100 - cloudOpacity) : bearishCloud ? color.new(color.red, 100 - cloudOpacity) : na
+fastPlot = plot(showMfiCloud ? fastMfi : na, title="快速MFI EMA", color=color.new(color.blue, 0), linewidth=1, display=display.none)
+slowPlot = plot(showMfiCloud ? slowMfi : na, title="慢速MFI EMA", color=color.new(color.orange, 0), linewidth=1, display=display.none)
+fill(fastPlot, slowPlot, color=showMfiCloud ? fillColor : na, title="MFI云")
+
+// ---- 参考线 ----
+hline(overbought, "超买线", color=showZones ? color.new(#FF5252, 0) : na, linestyle=hline.style_dashed)
+hline(oversold, "超卖线", color=showZones ? color.new(#00C853, 0) : na, linestyle=hline.style_dashed)
+hline(50, "中线", color=showMiddleLine ? color.new(#616161, 0) : na, linestyle=hline.style_dashed)
+
+// ---- 买卖信号标记 ----
+plotshape(buySignal ? oversold - 5 : na, title="买入信号", location=location.absolute, color=color.new(#00FF00, 0), style=shape.labelup, size=size.tiny)
+plotshape(sellSignal ? overbought + 5 : na, title="卖出信号", location=location.absolute, color=color.new(#FF0000, 0), style=shape.labeldown, size=size.tiny)
+
+// ---- 区域背景 ----
+bgcolor(showZones and rsi >= overbought ? color.new(#FF5252, 90) : na, title="超买区域")
+bgcolor(showZones and rsi <= oversold ? color.new(#00C853, 90) : na, title="超卖区域")
+
+// ========== 提醒模块 ==========
+alertcondition(buySignal, title="买入信号提醒", message="RSI买入信号 @ {{close}}")
+alertcondition(sellSignal, title="卖出信号提醒", message="RSI卖出信号 @ {{close}}")
+
+// ========== 信息面板模块 ==========
+var table infoTable = table.new(position.top_right, 2, 5, border_width=1, bgcolor=color.new(#2D3436, 90))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "RSI值", text_color=color.gray)
+    table.cell(infoTable, 1, 0, str.tostring(rsi, "#.00"), 
+              text_color=rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.white)
+    
+    table.cell(infoTable, 0, 1, "MFI趋势", text_color=color.gray)
+    table.cell(infoTable, 1, 1, bullishCloud ? "看涨" : bearishCloud ? "看跌" : "中性",
+              text_color=bullishCloud ? color.green : bearishCloud ? color.red : color.gray)
+    
+    table.cell(infoTable, 0, 2, "状态", text_color=color.gray)
+    table.cell(infoTable, 1, 2, rsi >= overbought ? "超买" : rsi <= oversold ? "超卖" : "正常",
+              text_color=rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.white)
+    
+    table.cell(infoTable, 0, 3, "最近信号", text_color=color.gray)
+    table.cell(infoTable, 1, 3, lastSignal, text_color=lastSignalColor)
+    
+    table.cell(infoTable, 0, 4, "动量", text_color=color.gray)
+    table.cell(infoTable, 1, 4, ta.change(rsi, 1) > 0 ? "上升" : "下降",
+              text_color=ta.change(rsi, 1) > 0 ? color.green : color.red)

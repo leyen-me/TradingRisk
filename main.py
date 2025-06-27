@@ -1,3 +1,4 @@
+import os
 import logging
 import threading
 from datetime import datetime, date, timedelta
@@ -10,44 +11,56 @@ from flask import Flask, request, jsonify
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
 from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType
 
+# ====== 日志配置区 ======
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
 
-config = Config.from_env()
-quote_ctx = QuoteContext(config)
-trade_ctx = TradeContext(config)
-
+# ====== 枚举，ClassData区 ======
 class Action(Enum):
     BUY = "buy"
     SELL = "sell"
 
-position_symbol = None                      # 开仓标的
-position_price = Decimal('0')               # 开仓价格
-position_stop_loss_price = Decimal('0')     # 止损平仓价格
-position_take_profit_price = Decimal('0')   # 止盈平仓价格
 
-# 订单ID
-stop_order_id = None
-take_profit_order_id = None
+# ====== 环境变量区 ======
+LONGPORT_WEBHOOK_SECRET = os.getenv("LONGPORT_WEBHOOK_SECRET")
+CONFIG = Config.from_env()
 
-position_quantity = Decimal('0')            # 开仓数量
 
+# ====== 配置参数区 ======
+OPEN_COOLDOWN_MINUTES = 10 # 冷却时间，单位分钟
+OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60  # 换算成秒
+TAKE_PROFIT_RATIO = Decimal('1.025')  # 止盈比例（2.5%）
+STOP_LOSS_RATIO = Decimal('0.8') # 止损比例（0.8倍）
+PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
+MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
+
+
+# ====== 其他全局变量 ======
+last_open_time = None # 记录上一次开仓时间
+position_symbol = None # 开仓标的
+position_price = Decimal('0') # 开仓价格
+position_stop_loss_price = Decimal('0') # 止损平仓价格
+position_take_profit_price = Decimal('0') # 止盈平仓价格
+stop_order_id = None # 止损订单ID
+take_profit_order_id = None # 止盈订单ID
+position_quantity = Decimal('0') # 开仓数量
 position_lock = threading.Lock()
-
-MAX_PROCESSED_ORDERS = 1000
 processed_order_ids = OrderedDict()
+
+quote_ctx = QuoteContext(CONFIG)
+trade_ctx = TradeContext(CONFIG)
+app = Flask(__name__)
+
 
 
 def get_min_20_price():
     lowest = None
     try:
-        arr = []
         resp = quote_ctx.candlesticks(position_symbol, Period.Min_2, 20, AdjustType.NoAdjust, TradeSessions.Intraday)
-        for item in resp:
-            arr.append(item.low)
-        lowest = min([item.low for item in resp])
+        lows = [item.low for item in resp]
+        if lows:
+            lowest = min(lows)
         logging.info(f"查询到最近20根K线的最低价:{str(lowest)}")
     except Exception as e:
         logger.warning(f"查询最低价失败: {e}")
@@ -57,7 +70,7 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
     """
     设置开仓信息
     """
-    global position_symbol, position_price, position_quantity
+    global position_symbol, position_price, position_quantity, last_open_time
     global position_stop_loss_price, position_take_profit_price
     if sell:
         logger.info("================开始重置订单信息================")
@@ -66,25 +79,27 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         position_quantity = Decimal('0')
         position_stop_loss_price = Decimal('0')
         position_take_profit_price = Decimal('0')
+        last_open_time = None
         logger.info("================重置订单信息成功================")
     else:
         logger.info("================开始添加下单信息================")
         position_symbol = event.symbol
         position_price = event.submitted_price
         position_quantity = event.executed_quantity
+        last_open_time = datetime.now()
 
         print("原始价格:" + str(position_price))
 
         min_20_price = get_min_20_price()
         if min_20_price is None:
-            position_stop_loss_price = (position_price * Decimal('0.8')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+            position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
         else:
             position_stop_loss_price = min_20_price
         
         print("止损价格:" + str(position_stop_loss_price))
 
         # 每笔交易2.5%止盈
-        position_take_profit_price = (event.submitted_price * Decimal('1.025')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+        position_take_profit_price = (event.submitted_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
         print("止盈价格:" + str(position_take_profit_price))
 
         logger.info("================添加下单信息成功================")
@@ -308,56 +323,93 @@ def trade_option(symbol: str, action: Action, window: int = 2):
     logger.info(f"选择下单的期权: {chosen_symbol} 行权价: {strike_price}")
     submit_option_order(action, chosen_symbol)
 
+def validate_position_time_range():
+    """固定时间内只开仓一次"""
+    global last_open_time
+    if last_open_time is not None:
+        delta = (datetime.now() - last_open_time).total_seconds()
+        if delta < OPEN_COOLDOWN_SECONDS:
+            raise Exception(f"冷却时间未到，拒绝开仓。距离上次开仓{delta}秒")
+
+def is_weekend(dt: datetime) -> bool:
+    return dt.weekday() >= 5
+
+def get_trading_session(dt: datetime):
+    """返回美股夜盘的开盘和收盘时间"""
+    if dt.hour >= 21:
+        open_time = dt.replace(hour=21, minute=30, second=0, microsecond=0)
+        close_time = (dt + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+    elif dt.hour < 4:
+        open_time = (dt - timedelta(days=1)).replace(hour=21, minute=30, second=0, microsecond=0)
+        close_time = dt.replace(hour=4, minute=0, second=0, microsecond=0)
+    else:
+        return None, None
+    return open_time, close_time
+
+def validate_active_time(active_time: datetime = None):
+    """只在交易活跃期间开仓，以及末日期权无法平仓的风险"""
+    dt = active_time or datetime.now()
+
+    if is_weekend(dt):
+        raise Exception("周末不允许开仓")
+
+    open_time, close_time = get_trading_session(dt)
+    if not open_time or not close_time:
+        raise Exception("当前不在美股盘中时间段内，拒绝开仓")
+
+    allow_start = open_time + timedelta(minutes=30)  # 22:00
+    allow_end = close_time - timedelta(minutes=30)   # 03:30
+
+    if not (allow_start <= dt <= allow_end):
+        raise Exception("当前不在允许开仓时间段内，拒绝开仓")
+
+def parse_webhook_data(data):
+    """解析并校验 webhook 数据"""
+    ticker = data.get('ticker')
+    action = data.get('action')
+    if not ticker or not action:
+        raise ValueError("参数缺失：ticker 或 action")
+    try:
+        action_enum = Action(action)
+    except ValueError:
+        raise ValueError(f"无效的 action: {action}")
+    return ticker, action_enum
+
+def validate_auth(data):
+    token = data.get('token')
+    if token != LONGPORT_WEBHOOK_SECRET:
+        raise Exception("鉴权失败: Token 不正确")
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """
     {
         "ticker": "TSLA.US",
         "action": "buy/sell",
-        "time": "{{time}}"
+        "token": "xxx"
     }
     """
     try:
         webhook_data = request.json
-        logger.info(f"From TradingView Signal=======>")
-        logger.info(f"{webhook_data}")
+        logger.info(f"收到 TradingView 信号: {webhook_data}")
+        validate_auth(webhook_data)
+        ticker, action_enum = parse_webhook_data(webhook_data)
+        validate_position_time_range()
+        validate_active_time()
+        trade_option(ticker, action_enum)
 
-        ticker_str = webhook_data.get('ticker')
-        action_str = webhook_data.get('action')
-
-        time_str = webhook_data.get('time')
-        # 假设 time_str 格式为 'YYYY-MM-DD HH:MM:SS'
-        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        # 美股开盘和收盘时间（北京时间）
-        open_time = dt.replace(hour=21, minute=30, second=0, microsecond=0)
-        close_time = (open_time + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
-        # 允许开仓时间段
-        allow_start = open_time + timedelta(minutes=30)  # 22:00
-        allow_end = close_time - timedelta(minutes=30)   # 03:30
-
-        # 周五24:00之后不允许开仓
-        if dt.weekday() == 4 and dt.hour >= 24:
-            logger.info("周五24:00后不允许开仓")
-            return jsonify({'code':403, 'status': 'forbidden', 'msg': '周五24:00后不允许开仓'}), 200
-        if dt.weekday() == 5:  # 周六
-            logger.info("周六不允许开仓")
-            return jsonify({'code':403, 'status': 'forbidden', 'msg': '周六不允许开仓'}), 200
-
-        if not (allow_start <= dt <= allow_end):
-            logger.info("当前不在允许开仓时间段内，拒绝开仓")
-            return jsonify({'code':403, 'status': 'forbidden', 'msg': '不在允许开仓时间段'}), 200
-
-        # 开仓
-        trade_option(ticker_str, Action(action_str))
         return jsonify({'code':200, 'status': 'success'}), 200
+    except ValueError as ve:
+        logger.warning(f"参数错误: {ve}")
+        return jsonify({'code': 400, 'status': 'error', 'msg': str(ve)}), 400
     except Exception as e:
+        logger.warning(f"处理失败: {e}")
         return jsonify({'code':500, 'status': 'error', 'msg': str(e)}), 500
 
 @app.route('/webhook_test', methods=['POST'])
 def webhook_test():
     webhook_data = request.json
-    logger.info(f"From TradingView Signal=======>")
-    logger.info(f"{webhook_data}")
+    logger.info(f"收到 TradingView 信号: {webhook_data}")
 
     return jsonify({'code':200, 'status': 'success'}), 200
 
@@ -367,6 +419,3 @@ trade_ctx.subscribe([TopicType.Private])
 if __name__ == '__main__':
     logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     app.run(host='0.0.0.0', port=80)
-
-    # test
-    # trade_option("TSLA.US", Action("buy"))

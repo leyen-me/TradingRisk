@@ -322,8 +322,8 @@ def webhook():
         logger.info(f"From TradingView Signal=======>")
         logger.info(f"{webhook_data}")
 
-        ticker = webhook_data.get('ticker')
-        action = webhook_data.get('action')
+        ticker_str = webhook_data.get('ticker')
+        action_str = webhook_data.get('action')
 
         time_str = webhook_data.get('time')
         # 假设 time_str 格式为 'YYYY-MM-DD HH:MM:SS'
@@ -336,8 +336,6 @@ def webhook():
         allow_end = close_time - timedelta(minutes=30)   # 03:30
 
         # 周五24:00之后不允许开仓
-        # dt.weekday() == 4 表示周五
-        friday_midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=(5 - dt.weekday()) % 7)
         if dt.weekday() == 4 and dt.hour >= 24:
             logger.info("周五24:00后不允许开仓")
             return jsonify({'code':403, 'status': 'forbidden', 'msg': '周五24:00后不允许开仓'}), 200
@@ -350,7 +348,7 @@ def webhook():
             return jsonify({'code':403, 'status': 'forbidden', 'msg': '不在允许开仓时间段'}), 200
 
         # 开仓
-        trade_option(ticker, action)
+        trade_option(ticker_str, Action(action_str))
         return jsonify({'code':200, 'status': 'success'}), 200
     except Exception as e:
         return jsonify({'code':500, 'status': 'error', 'msg': str(e)}), 500
@@ -369,3 +367,6 @@ trade_ctx.subscribe([TopicType.Private])
 if __name__ == '__main__':
     logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     app.run(host='0.0.0.0', port=80)
+
+    # test
+    # trade_option("TSLA.US", Action("buy"))

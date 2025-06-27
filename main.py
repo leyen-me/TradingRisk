@@ -380,6 +380,12 @@ def validate_auth(data):
     if token != LONGPORT_WEBHOOK_SECRET:
         raise Exception("鉴权失败: Token 不正确")
 
+
+@app.route('/')
+def home():
+    return jsonify({'code':200, 'status': 'success'}), 200
+
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """

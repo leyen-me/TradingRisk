@@ -30,8 +30,8 @@ CONFIG = Config.from_env()
 # ====== 配置参数区 ======
 OPEN_COOLDOWN_MINUTES = 10 # 冷却时间，单位分钟
 OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60  # 换算成秒
-TAKE_PROFIT_RATIO = Decimal('1.025')  # 止盈比例（2.5%）
-STOP_LOSS_RATIO = Decimal('0.8') # 止损比例（0.8倍）
+TAKE_PROFIT_RATIO = Decimal('1.05')  # 止盈比例（2.5%）
+STOP_LOSS_RATIO = Decimal('0.95') # 止损比例（0.8倍）
 PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
 MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
 
@@ -89,13 +89,7 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         last_open_time = datetime.now()
 
         print("原始价格:" + str(position_price))
-
-        min_20_price = get_min_20_price()
-        if min_20_price is None:
-            position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
-        else:
-            position_stop_loss_price = min_20_price
-        
+        position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
         print("止损价格:" + str(position_stop_loss_price))
 
         # 每笔交易2.5%止盈

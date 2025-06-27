@@ -8,8 +8,9 @@ from enum import Enum
 from typing import Optional
 
 from flask import Flask, request, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
-from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType
+from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType, OutsideRTH
 
 # ====== 日志配置区 ======
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,20 +53,7 @@ quote_ctx = QuoteContext(CONFIG)
 trade_ctx = TradeContext(CONFIG)
 app = Flask(__name__)
 
-
-
-def get_min_20_price():
-    lowest = None
-    try:
-        resp = quote_ctx.candlesticks(position_symbol, Period.Min_2, 20, AdjustType.NoAdjust, TradeSessions.Intraday)
-        lows = [item.low for item in resp]
-        if lows:
-            lowest = min(lows)
-        logging.info(f"查询到最近20根K线的最低价:{str(lowest)}")
-    except Exception as e:
-        logger.warning(f"查询最低价失败: {e}")
-    return lowest
-
+# ====== 函数区 ======
 def set_position_info(event: PushOrderChanged, sell: bool = False):
     """
     设置开仓信息
@@ -97,6 +85,24 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         print("止盈价格:" + str(position_take_profit_price))
 
         logger.info("================添加下单信息成功================")
+
+def auto_close_position():
+    """每天定时自动平仓"""
+    try:
+        if position_symbol is None:
+            logger.info("没有持仓，跳过平仓")
+            return
+        trade_ctx.submit_order(
+            position_symbol,
+            OrderType.MO,
+            OrderSide.Sell,
+            position_quantity,
+            TimeInForceType.GoodTilCanceled,
+            outside_rth=OutsideRTH.AnyTime,
+        )
+        logger.info(f"平仓下单完成 - 股票：{position_symbol}，数量：{str(position_quantity)}")
+    except Exception as e:
+        logger.error(f"下单失败: {e}")
 
 def set_position_risk():
     """
@@ -407,9 +413,16 @@ def webhook_test():
 
     return jsonify({'code':200, 'status': 'success'}), 200
 
-trade_ctx.set_on_order_changed(on_order_changed)
-trade_ctx.subscribe([TopicType.Private])
+
 
 if __name__ == '__main__':
     logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
+    trade_ctx.set_on_order_changed(on_order_changed)
+    trade_ctx.subscribe([TopicType.Private])
+
+    scheduler = BackgroundScheduler()
+
+    scheduler.add_job(auto_close_position, 'cron', hour=3, minute=30)
+    scheduler.start()
     app.run(host='0.0.0.0', port=80)

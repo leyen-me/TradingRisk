@@ -350,6 +350,9 @@ def validate_active_time(active_time: datetime = None):
     """只在交易活跃期间开仓，以及末日期权无法平仓的风险"""
     dt = active_time or datetime.now()
 
+    if dt.weekday() == 4 and dt.hour >= 21:
+        raise Exception("周五晚上21:30后不允许开仓")
+
     if is_weekend(dt):
         raise Exception("周末不允许开仓")
 

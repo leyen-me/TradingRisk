@@ -10,7 +10,7 @@ from typing import Optional
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
-from longport.openapi import OrderSide, TimeInForceType, Period, AdjustType, TradeSessions, TopicType, OutsideRTH
+from longport.openapi import OrderSide, TimeInForceType, TopicType, OutsideRTH
 
 # ====== 日志配置区 ======
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,6 +22,10 @@ class Action(Enum):
     BUY = "buy"
     SELL = "sell"
 
+class TradingMode(Enum):
+    ETF = "etf"  # x倍etf模式
+    OPTION = "option"  # 日内期权模式
+
 
 # ====== 环境变量区 ======
 LONGPORT_WEBHOOK_SECRET = os.getenv("LONGPORT_WEBHOOK_SECRET")
@@ -29,12 +33,14 @@ CONFIG = Config.from_env()
 
 
 # ====== 配置参数区 ======
+PROFIT_LOSS_RATIO = 0.03 # 止盈止损比例（+—3%）
 OPEN_COOLDOWN_MINUTES = 10 # 冷却时间，单位分钟
 OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60  # 换算成秒
-TAKE_PROFIT_RATIO = Decimal('1.05')  # 止盈比例（+5%）
-STOP_LOSS_RATIO = Decimal('0.95') # 止损比例（-5%）
+TAKE_PROFIT_RATIO = Decimal(str(1 + PROFIT_LOSS_RATIO))  # 止盈比例
+STOP_LOSS_RATIO = Decimal(str(1 - PROFIT_LOSS_RATIO)) # 止损比例
 PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
 MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
+ETF_MODEL = TradingMode("option") # 日内交易需要加杠杆
 
 
 # ====== 其他全局变量 ======
@@ -73,17 +79,13 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         logger.info("================开始添加下单信息================")
         position_symbol = event.symbol
         position_price = event.submitted_price
+        print("原始价格:" + str(position_price))
         position_quantity = event.executed_quantity
         last_open_time = datetime.now()
-
-        print("原始价格:" + str(position_price))
         position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
         print("止损价格:" + str(position_stop_loss_price))
-
-        # 每笔交易2.5%止盈
         position_take_profit_price = (event.submitted_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
         print("止盈价格:" + str(position_take_profit_price))
-
         logger.info("================添加下单信息成功================")
 
 def auto_close_position():
@@ -287,6 +289,19 @@ def submit_option_order(action: Action, symbol: str):
     except Exception as e:
         logger.error(f"下单失败: {e}")
 
+def trade_etf(symbol: str, action: Action):
+    """主流程：选择合适ETF并下单"""
+    pass
+
+def trade(symbol: str, action: Action):
+    """根据交易模式选择交易方式"""
+    if ETF_MODEL == TradingMode.ETF:
+        trade_etf(symbol, action)
+    elif ETF_MODEL == TradingMode.OPTION:
+        trade_option(symbol, action)
+    else:
+        raise ValueError(f"未知的交易模式: {ETF_MODEL}")
+
 def trade_option(symbol: str, action: Action, window: int = 2):
     """主流程：选择合适期权并下单"""
     # 1. 获取标的价格
@@ -408,7 +423,7 @@ def webhook():
         # 冷静期代码移动到策略中了，这里暂时注释
         # validate_position_time_range()
         validate_active_time()
-        trade_option(ticker, action_enum)
+        trade(ticker, action_enum)
 
         return jsonify({'code':200, 'status': 'success'}), 200
     except ValueError as ve:
@@ -417,14 +432,6 @@ def webhook():
     except Exception as e:
         logger.warning(f"处理失败: {e}")
         return jsonify({'code':500, 'status': 'error', 'msg': str(e)}), 500
-
-@app.route('/webhook_test', methods=['POST'])
-def webhook_test():
-    webhook_data = request.json
-    logger.info(f"收到 TradingView 信号: {webhook_data}")
-
-    return jsonify({'code':200, 'status': 'success'}), 200
-
 
 
 if __name__ == '__main__':

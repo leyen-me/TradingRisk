@@ -1,21 +1,71 @@
-# 长桥证券日内期权风控系统
+[🇨🇳 中文文档](./README.zh.md)
 
-## 适用
+# Longbridge Securities Intraday Options Quantitative Trading System
 
-高流动性股票的日内期权（TSLA.US），不持仓过夜。
+## Introduction
 
-## 入场
+This project is an intraday options quantitative trading system based on the Longbridge Securities API. It supports automated order placement, take-profit/stop-loss, risk control, and is suitable for highly liquid US stock options (e.g., TSLA.US).
 
-找到适合的剥头皮策略，利用TradingView的警报发出指令（webhook），然后程序接收做空做多指令，执行开仓止盈止损等逻辑。
+## Entry
 
-## 止盈止损
+Find a suitable scalping strategy on TradingView, use TradingView alerts to send instructions (webhook), and the program will receive long/short signals and execute opening, take-profit, and stop-loss logic. My strategy is in the Pine folder, using an RSI reversal pattern. The drawback is that bottom-fishing may not catch the absolute bottom, and shorting may not catch the absolute top.
 
-开仓后立即设置止盈止损，止盈止损设置为5%固定平仓
+## Exit
 
-## 我的交易系统
+Set take-profit and stop-loss immediately after opening a position. Both are set at a fixed 3% for closing, with a risk-reward ratio of 1:1, targeting 1-2 candlesticks.
 
-我的交易系统如下：https://docs.qq.com/doc/DZHdvUnJQTkJIeXBa
+If the option price moves sideways after buying (neither hitting take-profit nor stop-loss), the system will automatically close your position at 3:30 AM every day (even if neither take-profit nor stop-loss is triggered). This prevents indefinite holding, avoiding time value decay and overnight risk.
 
-## 说明
+## Installation
 
-交易有风险，投资需谨慎。建议先使用模拟仓试盘，本项目相关投资逻辑和代码不构成投资建议。
+### Environment
+
+```sh
+python >= 3.8
+```
+
+### Clone the repository
+
+```sh
+git clone https://github.com/leyen-me/TradingRisk.git
+```
+
+### Install dependencies
+
+```sh
+pip install -r requirements.txt
+```
+
+### Configure environment variables
+
+```env
+LONGPORT_APP_KEY=xxx
+LONGPORT_APP_SECRET=xxx
+LONGPORT_ACCESS_TOKEN=xxx
+# These three variables are obtained from the official Longbridge SDK. Log in and activate your account. Note: LONGPORT_ACCESS_TOKEN distinguishes between simulation and real accounts.
+
+LONGPORT_WEBHOOK_SECRET=xxx
+# This variable is custom for this program to prevent API abuse. Set it to any password (6-12 characters recommended).
+```
+
+### Start
+
+```sh
+python main.py
+```
+
+### Deployment
+
+This project supports both native and Docker deployment.
+
+## Disclaimer
+
+Trading involves risk. Please use a simulation account for testing first. The investment logic and code in this project do not constitute investment advice.
+
+## Contribution
+
+Issues and PRs are welcome to improve this project.
+
+## License
+
+This project is open-sourced under the MIT License.

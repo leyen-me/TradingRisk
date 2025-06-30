@@ -14,6 +14,7 @@ from longport.openapi import OrderSide, TimeInForceType, TopicType, OutsideRTH
 
 # ====== 日志配置区 ======
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -21,10 +22,6 @@ logger = logging.getLogger(__name__)
 class Action(Enum):
     BUY = "buy"
     SELL = "sell"
-
-class TradingMode(Enum):
-    ETF = "etf"  # x倍etf模式
-    OPTION = "option"  # 日内期权模式
 
 
 # ====== 环境变量区 ======
@@ -40,7 +37,6 @@ TAKE_PROFIT_RATIO = Decimal(str(1 + PROFIT_LOSS_RATIO))  # 止盈比例
 STOP_LOSS_RATIO = Decimal(str(1 - PROFIT_LOSS_RATIO)) # 止损比例
 PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
 MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
-ETF_MODEL = TradingMode("option") # 日内交易需要加杠杆
 
 
 # ====== 其他全局变量 ======
@@ -54,6 +50,7 @@ take_profit_order_id = None # 止盈订单ID
 position_quantity = Decimal('0') # 开仓数量
 position_lock = threading.Lock()
 processed_order_ids = OrderedDict()
+pending_orders = {}  # order_id: (submit_time, symbol)
 
 quote_ctx = QuoteContext(CONFIG)
 trade_ctx = TradeContext(CONFIG)
@@ -79,13 +76,13 @@ def set_position_info(event: PushOrderChanged, sell: bool = False):
         logger.info("================开始添加下单信息================")
         position_symbol = event.symbol
         position_price = event.submitted_price
-        print("原始价格:" + str(position_price))
+        logger.info("原始价格:" + str(position_price))
         position_quantity = event.executed_quantity
         last_open_time = datetime.now()
         position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
-        print("止损价格:" + str(position_stop_loss_price))
+        logger.info("止损价格:" + str(position_stop_loss_price))
         position_take_profit_price = (event.submitted_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
-        print("止盈价格:" + str(position_take_profit_price))
+        logger.info("止盈价格:" + str(position_take_profit_price))
         logger.info("================添加下单信息成功================")
 
 def auto_close_position():
@@ -162,7 +159,11 @@ def cancel_position_risk_order():
         take_profit_order_id = None
 
 def on_order_changed(event: PushOrderChanged):
+    """订单变更，多线程回调，采用position_lock"""
     with position_lock:
+        if event.order_id in pending_orders and event.status in [OrderStatus.Filled, OrderStatus.Canceled]:
+            pending_orders.pop(event.order_id, None)
+        
         if event.status == OrderStatus.Filled:
             global processed_order_ids
             logger.info(f"on_order_changed: {event.order_id}")
@@ -277,7 +278,7 @@ def submit_option_order(action: Action, symbol: str):
             raise Exception("现金不够")
 
         logger.info(f"当前期权最大买入数量: {str(max_buy_resp.cash_max_qty)}")
-        trade_ctx.submit_order(
+        order = trade_ctx.submit_order(
             symbol,
             OrderType.LO,
             OrderSide.Buy,
@@ -286,21 +287,27 @@ def submit_option_order(action: Action, symbol: str):
             submitted_price=current_price
         )
         logger.info(f"下单完成 - 股票：{symbol}，数量：{str(max_buy_resp.cash_max_qty)}")
+
+        pending_orders[order.order_id] = (datetime.now(), symbol)
     except Exception as e:
         logger.error(f"下单失败: {e}")
 
-def trade_etf(symbol: str, action: Action):
-    """主流程：选择合适ETF并下单"""
-    pass
-
-def trade(symbol: str, action: Action):
-    """根据交易模式选择交易方式"""
-    if ETF_MODEL == TradingMode.ETF:
-        trade_etf(symbol, action)
-    elif ETF_MODEL == TradingMode.OPTION:
-        trade_option(symbol, action)
-    else:
-        raise ValueError(f"未知的交易模式: {ETF_MODEL}")
+def check_pending_orders():
+    """定时检查挂单，超时自动撤单"""
+    now = datetime.now()
+    timeout = timedelta(seconds=30)
+    to_cancel = []
+    for order_id, (submit_time, symbol) in list(pending_orders.items()):
+        if now - submit_time > timeout:
+            logger.info(f"订单{order_id}挂单超时，准备撤单")
+            try:
+                trade_ctx.cancel_order(order_id)
+                logger.info(f"订单{order_id}撤单成功")
+            except Exception as e:
+                logger.warning(f"订单{order_id}撤单失败: {e}")
+            to_cancel.append(order_id)
+    for order_id in to_cancel:
+        pending_orders.pop(order_id, None)
 
 def trade_option(symbol: str, action: Action, window: int = 2):
     """主流程：选择合适期权并下单"""
@@ -423,7 +430,7 @@ def webhook():
         # 冷静期代码移动到策略中了，这里暂时注释
         # validate_position_time_range()
         validate_active_time()
-        trade(ticker, action_enum)
+        trade_option(ticker, action_enum)
 
         return jsonify({'code':200, 'status': 'success'}), 200
     except ValueError as ve:
@@ -443,5 +450,7 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
 
     scheduler.add_job(auto_close_position, 'cron', hour=3, minute=30)
+    # 新增定时任务，每5秒检查一次挂单
+    scheduler.add_job(check_pending_orders, 'interval', seconds=5)
     scheduler.start()
     app.run(host='0.0.0.0', port=80)

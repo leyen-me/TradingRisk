@@ -9,355 +9,161 @@ from typing import Optional
 
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
-from longport.openapi import Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus
-from longport.openapi import OrderSide, TimeInForceType, TopicType, OutsideRTH
+from longport.openapi import (
+    Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus,
+    OrderSide, TimeInForceType, TopicType, OutsideRTH
+)
 
-# ====== 日志配置区 ======
+# ================== Logging Config ==================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger('apscheduler').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-
-# ====== 枚举，ClassData区 ======
+# ================== Enum & Constants ==================
 class Action(Enum):
     BUY = "buy"
     SELL = "sell"
 
-
-# ====== 环境变量区 ======
+# Environment variables
 LONGPORT_WEBHOOK_SECRET = os.getenv("LONGPORT_WEBHOOK_SECRET")
 CONFIG = Config.from_env()
 
+# Trading parameters
+PROFIT_LOSS_RATIO = 0.03  # Take profit/stop loss ratio (+/-3%)
+OPEN_COOLDOWN_MINUTES = 10
+OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60
+TAKE_PROFIT_RATIO = Decimal(str(1 + PROFIT_LOSS_RATIO))
+STOP_LOSS_RATIO = Decimal(str(1 - PROFIT_LOSS_RATIO))
+PRICE_PRECISION = Decimal('0.01')
+MAX_PROCESSED_ORDERS = 1000
 
-# ====== 配置参数区 ======
-PROFIT_LOSS_RATIO = 0.03 # 止盈止损比例（+—3%）
-OPEN_COOLDOWN_MINUTES = 10 # 冷却时间，单位分钟
-OPEN_COOLDOWN_SECONDS = OPEN_COOLDOWN_MINUTES * 60  # 换算成秒
-TAKE_PROFIT_RATIO = Decimal(str(1 + PROFIT_LOSS_RATIO))  # 止盈比例
-STOP_LOSS_RATIO = Decimal(str(1 - PROFIT_LOSS_RATIO)) # 止损比例
-PRICE_PRECISION = Decimal('0.01')  # 价格精度，小数点后两位
-MAX_PROCESSED_ORDERS = 1000 # 已处理订单最大缓存数
-
-
-# ====== 其他全局变量 ======
-last_open_time = None # 记录上一次开仓时间
-position_symbol = None # 开仓标的
-position_price = Decimal('0') # 开仓价格
-position_stop_loss_price = Decimal('0') # 止损平仓价格
-position_take_profit_price = Decimal('0') # 止盈平仓价格
-stop_order_id = None # 止损订单ID
-take_profit_order_id = None # 止盈订单ID
-position_quantity = Decimal('0') # 开仓数量
-position_lock = threading.Lock()
-processed_order_ids = OrderedDict()
-pending_orders = {}  # order_id: (submit_time, symbol)
+# ================== Global State ==================
+g_last_open_time = None
+g_position_symbol = None
+g_position_price = Decimal('0')
+g_position_stop_loss_price = Decimal('0')
+g_position_take_profit_price = Decimal('0')
+g_stop_order_id = None
+g_take_profit_order_id = None
+g_position_quantity = Decimal('0')
+g_position_lock = threading.Lock()
+g_processed_order_ids = OrderedDict()
+g_pending_orders = {}  # order_id: (submit_time, symbol)
 
 quote_ctx = QuoteContext(CONFIG)
 trade_ctx = TradeContext(CONFIG)
 app = Flask(__name__)
 
-# ====== 函数区 ======
-def set_position_info(event: PushOrderChanged, sell: bool = False):
-    """
-    设置开仓信息
-    """
-    global position_symbol, position_price, position_quantity, last_open_time
-    global position_stop_loss_price, position_take_profit_price
-    if sell:
-        logger.info("================开始重置订单信息================")
-        position_symbol = None
-        position_price = Decimal('0')
-        position_quantity = Decimal('0')
-        position_stop_loss_price = Decimal('0')
-        position_take_profit_price = Decimal('0')
-        last_open_time = None
-        logger.info("================重置订单信息成功================")
-    else:
-        logger.info("================开始添加下单信息================")
-        position_symbol = event.symbol
-        position_price = event.submitted_price
-        logger.info("原始价格:" + str(position_price))
-        position_quantity = event.executed_quantity
-        last_open_time = datetime.now()
-        position_stop_loss_price = (position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
-        logger.info("止损价格:" + str(position_stop_loss_price))
-        position_take_profit_price = (event.submitted_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
-        logger.info("止盈价格:" + str(position_take_profit_price))
-        logger.info("================添加下单信息成功================")
+# ================== Utility Functions ==================
+def reset_position():
+    """Reset all position-related global variables."""
+    global g_position_symbol, g_position_price, g_position_quantity
+    global g_position_stop_loss_price, g_position_take_profit_price, g_last_open_time
+    g_position_symbol = None
+    g_position_price = Decimal('0')
+    g_position_quantity = Decimal('0')
+    g_position_stop_loss_price = Decimal('0')
+    g_position_take_profit_price = Decimal('0')
+    g_last_open_time = None
 
-def auto_close_position():
-    """每天定时自动平仓"""
-    try:
-        if position_symbol is None:
-            logger.info("没有持仓，跳过平仓")
-            return
-        trade_ctx.submit_order(
-            position_symbol,
-            OrderType.MO,
-            OrderSide.Sell,
-            position_quantity,
-            TimeInForceType.GoodTilCanceled,
-            outside_rth=OutsideRTH.AnyTime,
-        )
-        logger.info(f"平仓下单完成 - 股票：{position_symbol}，数量：{str(position_quantity)}")
-    except Exception as e:
-        logger.error(f"下单失败: {e}")
-
-def set_position_risk():
-    """
-    设置止盈止损
-    """
-    global stop_order_id, take_profit_order_id
-    try:
-        stop_order = trade_ctx.submit_order(
-            position_symbol,
-            OrderType.MIT,
-            OrderSide.Sell,
-            position_quantity,
-            TimeInForceType.GoodTilCanceled,
-            trigger_price=position_stop_loss_price,
-            remark="止损",
-        )
-        stop_order_id = stop_order.order_id
-    except Exception as e:
-        logger.warning(f"增加止损订单失败: {e}")
-
-    try:
-        take_profit_order = trade_ctx.submit_order(
-            position_symbol,
-            OrderType.MIT,
-            OrderSide.Sell,
-            position_quantity,
-            TimeInForceType.GoodTilCanceled,
-            trigger_price=position_take_profit_price,
-            remark="止盈",
-        )
-        take_profit_order_id = take_profit_order.order_id
-    except Exception as e:
-        logger.warning(f"增加止盈订单失败: {e}")
-
-
-def cancel_position_risk_order():
-    """
-    自动撤销止损止盈的监听
-    """
-    global stop_order_id, take_profit_order_id
-    try:
-        trade_ctx.cancel_order(stop_order_id)
-        logger.info("自动撤销止损订单成功")
-    except Exception as e:
-        logger.warning(f"撤销止损监听失败: {e}")
-    finally:
-        stop_order_id = None
-
-    try:
-        trade_ctx.cancel_order(take_profit_order_id)
-        logger.info("自动撤销止盈订单成功")
-    except Exception as e:
-        logger.warning(f"撤销止盈监听失败: {e}")
-    finally:
-        take_profit_order_id = None
-
-def on_order_changed(event: PushOrderChanged):
-    """订单变更，多线程回调，采用position_lock"""
-    with position_lock:
-        if event.order_id in pending_orders and event.status in [OrderStatus.Filled, OrderStatus.Canceled]:
-            pending_orders.pop(event.order_id, None)
-        
-        if event.status == OrderStatus.Filled:
-            global processed_order_ids
-            logger.info(f"on_order_changed: {event.order_id}")
-            if event.order_id in processed_order_ids:
-                logger.info(f"订单 {event.order_id} 已处理，跳过")
-                return
-            
-            # processed_order_ids 这个 set 会随着订单数量的增加而无限增长，最终可能导致内存泄漏或占用过多内存。
-            processed_order_ids[event.order_id] = None
-            if len(processed_order_ids) > MAX_PROCESSED_ORDERS:
-                processed_order_ids.popitem(last=False)
-
-            if event.side == OrderSide.Buy:
-                if position_symbol is None:
-                    logger.info(f"发现买入订单:{event.symbol}")
-                    set_position_info(event)
-                    set_position_risk()
-            elif event.side == OrderSide.Sell:
-                if position_symbol is not None:
-                    logger.info(f"发现卖出订单:{position_symbol}")
-                    set_position_info(event, sell=True)
-                    cancel_position_risk_order()
-            else:
-                pass
+def update_position(event: PushOrderChanged):
+    """Update position info after a buy order is filled."""
+    global g_position_symbol, g_position_price, g_position_quantity, g_last_open_time
+    global g_position_stop_loss_price, g_position_take_profit_price
+    g_position_symbol = event.symbol
+    g_position_price = event.submitted_price
+    g_position_quantity = event.executed_quantity
+    g_last_open_time = datetime.now()
+    g_position_stop_loss_price = (g_position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
+    g_position_take_profit_price = (g_position_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
 
 def get_current_price(action: Action, symbol: str) -> Optional[float]:
-    """获取当前盘口价格"""
+    """Get the current best ask/bid price for the given symbol."""
     try:
         resp = quote_ctx.depth(symbol)
-        if resp.asks and resp.bids:
-            if action == Action.BUY:
-                price = resp.asks[0].price
-                if price is not None:
-                    return price
-                logger.warning("可能为夜盘，卖一价为空")
-            elif action == Action.SELL:
-                price = resp.bids[0].price
-                if price is not None:
-                    return price
-                logger.warning("可能为夜盘，买一价为空")
-        else:
-            logger.warning("当前无盘口数据...")
+        if action == Action.BUY and resp.asks:
+            return resp.asks[0].price
+        if action == Action.SELL and resp.bids:
+            return resp.bids[0].price
+        logger.warning("No market depth data available.")
     except Exception as e:
-        logger.warning(f"查询盘口失败: {e}")
+        logger.warning(f"Failed to fetch market depth: {e}")
     return None
 
-def get_underlying_price(symbol: str) -> Optional[float]:
-    """获取标的最新成交价"""
+def get_latest_price(symbol: str) -> Optional[float]:
+    """Get the latest traded price for the symbol."""
     try:
         price_resp = quote_ctx.quote([symbol])
         for item in price_resp:
             return item.last_done
     except Exception as e:
-        logger.warning(f"标的价格查询失败: {e}")
+        logger.warning(f"Failed to fetch latest price: {e}")
     return None
 
-def get_target_expiry_date(symbol: str) -> Optional[date]:
-    """获取下一个可用的期权到期日"""
+def get_next_expiry(symbol: str) -> Optional[date]:
+    """Get the next available option expiry date."""
     try:
         date_list = quote_ctx.option_chain_expiry_date_list(symbol)
         for item in date_list:
             if date.today() <= item:
                 return item
     except Exception as e:
-        logger.warning(f"查询期权日期失败: {e}")
+        logger.warning(f"Failed to fetch expiry dates: {e}")
     return None
 
-def get_option_chain_by_date(symbol: str, expiry: date):
-    """获取指定到期日的期权链信息"""
+def get_option_chain(symbol: str, expiry: date):
+    """Get the option chain for a given symbol and expiry date."""
     try:
         return quote_ctx.option_chain_info_by_date(symbol, expiry)
     except Exception as e:
-        logger.warning(f"查询期权链失败: {e}")
+        logger.warning(f"Failed to fetch option chain: {e}")
     return []
 
-def select_options_by_strike(options, current_price: float, window: int = 2):
-    """选取行权价在当前价格上下window档的期权"""
+def select_strike_options(options, price: float, window: int = 2):
+    """Select options with strike prices within a window around the current price."""
     strikes = [item.price for item in options]
     if not strikes:
         return []
-    closest_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - current_price))
-    selected_indices = range(max(0, closest_idx - window), min(len(strikes), closest_idx + window + 1))
-    return [options[i] for i in selected_indices]
+    closest_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - price))
+    indices = range(max(0, closest_idx - window), min(len(strikes), closest_idx + window + 1))
+    return [options[i] for i in indices]
 
-def choose_option(selected_options, action: Action):
-    """根据操作选择合适的期权合约symbol"""
+def choose_option_contract(selected_options, action: Action):
+    """Choose the best option contract based on action."""
     if not selected_options:
         return None, None
     if action == Action.BUY:
         chosen = max(selected_options, key=lambda x: x.price)
         return chosen.call_symbol, chosen.price
-    elif action == Action.SELL:
+    if action == Action.SELL:
         chosen = min(selected_options, key=lambda x: x.price)
         return chosen.put_symbol, chosen.price
     return None, None
 
-def submit_option_order(action: Action, symbol: str):
-    """提交期权买入订单"""
+def validate_auth(data):
+    """Validate webhook token."""
+    token = data.get('token')
+    if token != LONGPORT_WEBHOOK_SECRET:
+        raise Exception("Authentication failed: Invalid token.")
+
+def parse_webhook_data(data):
+    """Parse and validate webhook data."""
+    ticker = data.get('ticker')
+    action = data.get('action')
+    if not ticker or not action:
+        raise ValueError("Missing parameter: ticker or action.")
     try:
-        current_price = get_current_price(action, symbol)
-        if current_price is None:
-            logger.warning("没有查询到期权价格")
-            return
-        logger.info(f"当前期权价格为: {current_price}")
-        max_buy_resp = trade_ctx.estimate_max_purchase_quantity(
-            symbol=symbol,
-            order_type=OrderType.LO,
-            side=OrderSide.Buy,
-            price=current_price
-        )
-        if int(max_buy_resp.cash_max_qty) == 0:
-            raise Exception("现金不够")
-
-        logger.info(f"当前期权最大买入数量: {str(max_buy_resp.cash_max_qty)}")
-        order = trade_ctx.submit_order(
-            symbol,
-            OrderType.LO,
-            OrderSide.Buy,
-            max_buy_resp.cash_max_qty,
-            TimeInForceType.GoodTilCanceled,
-            submitted_price=current_price
-        )
-        logger.info(f"下单完成 - 股票：{symbol}，数量：{str(max_buy_resp.cash_max_qty)}")
-
-        pending_orders[order.order_id] = (datetime.now(), symbol)
-    except Exception as e:
-        logger.error(f"下单失败: {e}")
-
-def check_pending_orders():
-    """定时检查挂单，超时自动撤单"""
-    now = datetime.now()
-    timeout = timedelta(seconds=30)
-    to_cancel = []
-    for order_id, (submit_time, symbol) in list(pending_orders.items()):
-        if now - submit_time > timeout:
-            logger.info(f"订单{order_id}挂单超时，准备撤单")
-            try:
-                trade_ctx.cancel_order(order_id)
-                logger.info(f"订单{order_id}撤单成功")
-            except Exception as e:
-                logger.warning(f"订单{order_id}撤单失败: {e}")
-            to_cancel.append(order_id)
-    for order_id in to_cancel:
-        pending_orders.pop(order_id, None)
-
-def trade_option(symbol: str, action: Action, window: int = 2):
-    """主流程：选择合适期权并下单"""
-    # 1. 获取标的价格
-    current_price = get_underlying_price(symbol)
-    if current_price is None:
-        logger.warning("标的价格查询失败")
-        return
-    logger.info(f"当前标的价格为: {current_price}")
-
-    # 2. 获取期权到期日
-    expiry = get_target_expiry_date(symbol)
-    if expiry is None:
-        logger.warning("查询期权日期失败")
-        return
-    logger.info(f"目标期权日期为: {expiry}")
-
-    # 3. 获取期权链
-    options = get_option_chain_by_date(symbol, expiry)
-    if not options:
-        logger.warning("未获取到期权链信息")
-        return
-
-    # 4. 选取合适的期权
-    selected_options = select_options_by_strike(options, current_price, window)
-    logger.info("选中的期权档位：")
-    for opt in selected_options:
-        logger.info(f"行权价: {opt.price}, Call: {opt.call_symbol}, Put: {opt.put_symbol}")
-
-    chosen_symbol, strike_price = choose_option(selected_options, action)
-    if not chosen_symbol:
-        logger.warning("未选中合适的期权合约")
-        return
-
-    logger.info(f"选择下单的期权: {chosen_symbol} 行权价: {strike_price}")
-    submit_option_order(action, chosen_symbol)
-
-def validate_position_time_range():
-    """固定时间内只开仓一次"""
-    global last_open_time
-    if last_open_time is not None:
-        delta = (datetime.now() - last_open_time).total_seconds()
-        if delta < OPEN_COOLDOWN_SECONDS:
-            raise Exception(f"冷却时间未到，拒绝开仓。距离上次开仓{delta}秒")
+        action_enum = Action(action)
+    except ValueError:
+        raise ValueError(f"Invalid action: {action}")
+    return ticker, action_enum
 
 def is_weekend(dt: datetime) -> bool:
+    """Check if the given datetime is a weekend."""
     return dt.weekday() >= 5
 
 def get_trading_session(dt: datetime):
-    """返回美股夜盘的开盘和收盘时间"""
+    """Return the open and close time for US night session."""
     if dt.hour >= 21:
         open_time = dt.replace(hour=21, minute=30, second=0, microsecond=0)
         close_time = (dt + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
@@ -369,52 +175,203 @@ def get_trading_session(dt: datetime):
     return open_time, close_time
 
 def validate_active_time(active_time: datetime = None):
-    """只在交易活跃期间开仓，以及末日期权无法平仓的风险"""
+    """
+    Only allow trading during active session.
+    - No trading after 21:30 on Friday (risk of not being able to close position).
+    - No trading on weekends.
+    - Only allow trading during US night session (21:30-04:00), with a buffer.
+    """
     dt = active_time or datetime.now()
-
     if dt.weekday() == 4 and dt.hour >= 21:
-        raise Exception("周五晚上21:30后不允许开仓")
-
+        raise Exception("No trading after 21:30 on Friday.")
     if is_weekend(dt):
-        raise Exception("周末不允许开仓")
-
+        raise Exception("No trading on weekends.")
     open_time, close_time = get_trading_session(dt)
     if not open_time or not close_time:
-        raise Exception("当前不在美股盘中时间段内，拒绝开仓")
-
-    # allow_start = open_time + timedelta(minutes=30)  # 22:00
-    allow_start = open_time  # 21:30
-    allow_end = close_time - timedelta(minutes=30)   # 03:30
-
+        raise Exception("Not in US trading session.")
+    allow_start = open_time
+    allow_end = close_time - timedelta(minutes=30)
     if not (allow_start <= dt <= allow_end):
-        raise Exception("当前不在允许开仓时间段内，拒绝开仓")
+        raise Exception("Not in allowed trading time window.")
 
-def parse_webhook_data(data):
-    """解析并校验 webhook 数据"""
-    ticker = data.get('ticker')
-    action = data.get('action')
-    if not ticker or not action:
-        raise ValueError("参数缺失：ticker 或 action")
+def validate_cooldown():
+    """Ensure only one open position within cooldown period."""
+    global g_last_open_time
+    if g_last_open_time is not None:
+        delta = (datetime.now() - g_last_open_time).total_seconds()
+        if delta < OPEN_COOLDOWN_SECONDS:
+            raise Exception(f"Cooldown not finished. {delta:.0f}s since last open.")
+
+# ================== Trading Logic ==================
+def submit_option_order(action: Action, symbol: str):
+    """Submit an option order."""
     try:
-        action_enum = Action(action)
-    except ValueError:
-        raise ValueError(f"无效的 action: {action}")
-    return ticker, action_enum
+        price = get_current_price(action, symbol)
+        if price is None:
+            logger.warning("No option price available.")
+            return
+        max_buy_resp = trade_ctx.estimate_max_purchase_quantity(
+            symbol=symbol,
+            order_type=OrderType.LO,
+            side=OrderSide.Buy,
+            price=price
+        )
+        if int(max_buy_resp.cash_max_qty) == 0:
+            raise Exception("Insufficient cash.")
+        order = trade_ctx.submit_order(
+            symbol,
+            OrderType.LO,
+            OrderSide.Buy,
+            max_buy_resp.cash_max_qty,
+            TimeInForceType.GoodTilCanceled,
+            submitted_price=price
+        )
+        g_pending_orders[order.order_id] = (datetime.now(), symbol)
+        logger.info(f"Order submitted: {symbol}, qty: {max_buy_resp.cash_max_qty}")
+    except Exception as e:
+        logger.error(f"Order submission failed: {e}")
 
-def validate_auth(data):
-    token = data.get('token')
-    if token != LONGPORT_WEBHOOK_SECRET:
-        raise Exception("鉴权失败: Token 不正确")
+def trade_option(symbol: str, action: Action, window: int = 2):
+    """Main trading flow: select and submit option order."""
+    price = get_latest_price(symbol)
+    if price is None:
+        logger.warning("Failed to get underlying price.")
+        return
+    expiry = get_next_expiry(symbol)
+    if expiry is None:
+        logger.warning("Failed to get expiry date.")
+        return
+    options = get_option_chain(symbol, expiry)
+    if not options:
+        logger.warning("No option chain data.")
+        return
+    selected_options = select_strike_options(options, price, window)
+    for opt in selected_options:
+        logger.info(f"Strike: {opt.price}, Call: {opt.call_symbol}, Put: {opt.put_symbol}")
+    chosen_symbol, strike_price = choose_option_contract(selected_options, action)
+    if not chosen_symbol:
+        logger.warning("No suitable option contract selected.")
+        return
+    logger.info(f"Selected option: {chosen_symbol}, strike: {strike_price}")
+    submit_option_order(action, chosen_symbol)
 
+def set_position_risk():
+    """Set stop loss and take profit orders for the current position."""
+    global g_stop_order_id, g_take_profit_order_id
+    try:
+        stop_order = trade_ctx.submit_order(
+            g_position_symbol,
+            OrderType.MIT,
+            OrderSide.Sell,
+            g_position_quantity,
+            TimeInForceType.GoodTilCanceled,
+            trigger_price=g_position_stop_loss_price,
+            remark="Stop Loss"
+        )
+        g_stop_order_id = stop_order.order_id
+    except Exception as e:
+        logger.warning(f"Failed to set stop loss: {e}")
+    try:
+        take_profit_order = trade_ctx.submit_order(
+            g_position_symbol,
+            OrderType.MIT,
+            OrderSide.Sell,
+            g_position_quantity,
+            TimeInForceType.GoodTilCanceled,
+            trigger_price=g_position_take_profit_price,
+            remark="Take Profit"
+        )
+        g_take_profit_order_id = take_profit_order.order_id
+    except Exception as e:
+        logger.warning(f"Failed to set take profit: {e}")
 
+def cancel_risk_orders():
+    """Cancel stop loss and take profit orders."""
+    global g_stop_order_id, g_take_profit_order_id
+    try:
+        if g_stop_order_id:
+            trade_ctx.cancel_order(g_stop_order_id)
+            logger.info("Stop loss order cancelled.")
+    except Exception as e:
+        logger.warning(f"Failed to cancel stop loss: {e}")
+    finally:
+        g_stop_order_id = None
+    try:
+        if g_take_profit_order_id:
+            trade_ctx.cancel_order(g_take_profit_order_id)
+            logger.info("Take profit order cancelled.")
+    except Exception as e:
+        logger.warning(f"Failed to cancel take profit: {e}")
+    finally:
+        g_take_profit_order_id = None
+
+def auto_close_position():
+    """Automatically close position at scheduled time."""
+    if g_position_symbol is None:
+        logger.info("No position to close.")
+        return
+    try:
+        trade_ctx.submit_order(
+            g_position_symbol,
+            OrderType.MO,
+            OrderSide.Sell,
+            g_position_quantity,
+            TimeInForceType.GoodTilCanceled,
+            outside_rth=OutsideRTH.AnyTime,
+        )
+        logger.info(f"Auto close order submitted: {g_position_symbol}, qty: {g_position_quantity}")
+    except Exception as e:
+        logger.error(f"Auto close order failed: {e}")
+
+def check_pending_orders():
+    """Check and cancel pending orders that have timed out."""
+    now = datetime.now()
+    timeout = timedelta(seconds=30)
+    to_cancel = []
+    for order_id, (submit_time, symbol) in list(g_pending_orders.items()):
+        if now - submit_time > timeout:
+            try:
+                trade_ctx.cancel_order(order_id)
+                logger.info(f"Order {order_id} cancelled due to timeout.")
+            except Exception as e:
+                logger.warning(f"Failed to cancel order {order_id}: {e}")
+            to_cancel.append(order_id)
+    for order_id in to_cancel:
+        g_pending_orders.pop(order_id, None)
+
+def on_order_changed(event: PushOrderChanged):
+    """Order change callback, thread-safe."""
+    with g_position_lock:
+        if event.order_id in g_pending_orders and event.status in [OrderStatus.Filled, OrderStatus.Canceled]:
+            g_pending_orders.pop(event.order_id, None)
+        if event.status == OrderStatus.Filled:
+            if event.order_id in g_processed_order_ids:
+                logger.info(f"Order {event.order_id} already processed.")
+                return
+            g_processed_order_ids[event.order_id] = None
+            if len(g_processed_order_ids) > MAX_PROCESSED_ORDERS:
+                g_processed_order_ids.popitem(last=False)
+            if event.side == OrderSide.Buy:
+                if g_position_symbol is None:
+                    logger.info(f"Buy order filled: {event.symbol}")
+                    update_position(event)
+                    set_position_risk()
+            elif event.side == OrderSide.Sell:
+                if g_position_symbol is not None:
+                    logger.info(f"Sell order filled: {g_position_symbol}")
+                    reset_position()
+                    cancel_risk_orders()
+
+# ================== Flask Routes ==================
 @app.route('/')
 def home():
-    return jsonify({'code':200, 'status': 'success'}), 200
-
+    return jsonify({'code': 200, 'status': 'success'}), 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """
+    Webhook endpoint for TradingView signals.
+    Expected JSON:
     {
         "ticker": "TSLA.US",
         "action": "buy/sell",
@@ -422,35 +379,27 @@ def webhook():
     }
     """
     try:
-        webhook_data = request.json
-        logger.info(f"收到 TradingView 信号: {webhook_data}")
-        validate_auth(webhook_data)
-        ticker, action_enum = parse_webhook_data(webhook_data)
-
-        # 冷静期代码移动到策略中了，这里暂时注释
-        # validate_position_time_range()
+        data = request.json
+        logger.info(f"Received webhook: {data}")
+        validate_auth(data)
+        ticker, action_enum = parse_webhook_data(data)
         validate_active_time()
         trade_option(ticker, action_enum)
-
-        return jsonify({'code':200, 'status': 'success'}), 200
+        return jsonify({'code': 200, 'status': 'success'}), 200
     except ValueError as ve:
-        logger.warning(f"参数错误: {ve}")
+        logger.warning(f"Parameter error: {ve}")
         return jsonify({'code': 400, 'status': 'error', 'msg': str(ve)}), 400
     except Exception as e:
-        logger.warning(f"处理失败: {e}")
-        return jsonify({'code':500, 'status': 'error', 'msg': str(e)}), 500
+        logger.warning(f"Processing failed: {e}")
+        return jsonify({'code': 500, 'status': 'error', 'msg': str(e)}), 500
 
-
+# ================== Main ==================
 if __name__ == '__main__':
-    logger.info("启动成功，当前北京时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    
+    logger.info("Service started. Beijing time: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     trade_ctx.set_on_order_changed(on_order_changed)
     trade_ctx.subscribe([TopicType.Private])
-
     scheduler = BackgroundScheduler()
-
     scheduler.add_job(auto_close_position, 'cron', hour=3, minute=30)
-    # 新增定时任务，每5秒检查一次挂单
     scheduler.add_job(check_pending_orders, 'interval', seconds=5)
     scheduler.start()
     app.run(host='0.0.0.0', port=80)

@@ -557,7 +557,7 @@ def webhook():
         validate_auth(data)
         symbol, mode_enum = parse_webhook_data(data)
         update_us_stock_trading_hours()
-        validate_active_time()
+        # validate_active_time()
         g_position_mode = mode_enum
         trade(symbol, mode_enum)
         return jsonify({'code': 200, 'status': 'success'}), 200

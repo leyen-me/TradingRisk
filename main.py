@@ -326,7 +326,7 @@ def validate_active_time(active_time: datetime = None):
         raise Exception("Not in US trading session.")
 
     # No trading shall be permitted within the first 30 minutes after the market opens and within the last 30 minutes before the market closes.
-    allow_start = open_time # + timedelta(minutes=30)
+    allow_start = open_time + timedelta(minutes=30)
     allow_end = close_time - timedelta(minutes=30)
     if not (allow_start <= dt <= allow_end):
         raise Exception("Not in allowed trading time window.")

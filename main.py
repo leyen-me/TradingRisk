@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from longport.openapi import (
     Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus,
-    OrderSide, TimeInForceType, TopicType, OutsideRTH
+    OrderSide, TimeInForceType, TopicType, OutsideRTH, Period, AdjustType, TradeSessions
 )
 
 # ================== Logging Config ==================
@@ -126,6 +126,19 @@ def get_local_trading_day(now=None):
     else:
         return (now - timedelta(days=1)).date()
 
+def get_min_5_price():
+    """Get the lowest price in the last 5 minutes."""
+    lowest = None
+    try:
+        resp = quote_ctx.candlesticks(g_position_symbol, Period.Min_1, 5, AdjustType.NoAdjust, TradeSessions.Intraday)
+        lows = [item.low for item in resp]
+        if lows:
+            lowest = min(lows)
+        logging.info(f"查询到最近20根K线的最低价:{str(lowest)}")
+    except Exception as e:
+        logger.warning(f"查询最低价失败: {e}")
+    return lowest
+
 def reset_position():
     """Reset all position-related global variables."""
     global g_position_symbol, g_position_price, g_position_quantity
@@ -145,6 +158,8 @@ def update_position(event: PushOrderChanged):
     g_position_price = event.submitted_price
     g_position_quantity = event.executed_quantity
     g_last_open_time = datetime.now()
+
+    # 计算止损和止盈价格
     TAKE_PROFIT_RATIO = None
     STOP_LOSS_RATIO = None
     if g_position_mode == Mode.OPTION:
@@ -157,6 +172,15 @@ def update_position(event: PushOrderChanged):
         raise ValueError(f"Invalid position mode: {g_position_mode}")
     g_position_stop_loss_price = (g_position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
     g_position_take_profit_price = (g_position_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
+
+    # 如果最近5分钟最低价低于当前价格，则止损价格为最低价
+    lowest_price = get_min_5_price()
+    if lowest_price is not None:
+        if lowest_price < g_position_price:
+            g_position_stop_loss_price = lowest_price
+        else:
+            # 股价一直下跌，没有最低价
+            pass
 
 def reset_daily_trade_state():
     global g_today_trades, g_today_date, g_today_profit

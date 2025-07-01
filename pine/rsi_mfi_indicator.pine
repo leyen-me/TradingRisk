@@ -7,8 +7,8 @@ indicator("RSI_MFI", overlay=false, shorttitle="RSI_MFI", precision=2, max_label
 // ========== 输入设置 ==========
 // ---- RSI 设置 ----
 rsiLength = input(14, title="RSI周期", group="RSI设置")
-oversold = input(24, title="超卖线", group="RSI设置")
-overbought = input(75, title="超买线", group="RSI设置")
+oversold = input(29, title="超卖线", group="RSI设置")
+overbought = input(78, title="超买线", group="RSI设置")
 src = input(close, title="计算源", group="RSI设置")
 
 // ---- MFI云 设置 ----

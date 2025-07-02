@@ -1,0 +1,185 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © RanaAlgo
+
+//@version=5
+indicator("RSI Buy Sell Signals+ with MFI Cloud [RanaAlgo]", overlay=false, shorttitle="RSI++ MFI Cloud [RanaAlgo]", precision=2, max_labels_count=500)
+
+// ========== INPUT SETTINGS ==========
+// RSI Settings
+rsiLength = input(14, title="RSI Length", group="RSI Settings")
+oversold = input(30, title="Oversold Level", group="RSI Settings")
+overbought = input(70, title="Overbought Level", group="RSI Settings")
+src = input(close, title="Source", group="RSI Settings")
+
+// MFI Cloud Settings
+mfiLength = input(20, title="MFI Length", group="MFI Cloud Settings")
+fastMfiEma = input(5, title="Fast MFI EMA", group="MFI Cloud Settings")
+slowMfiEma = input(13, title="Slow MFI EMA", group="MFI Cloud Settings")
+cloudOpacity = input.int(40, title="Cloud Opacity", minval=10, maxval=90, group="MFI Cloud Settings")
+
+// Signal Configuration
+requireVolume = input(false, title="Require Volume Confirmation", group="Signal Settings")
+trendConfirmation = input(false, title="Require Trend Confirmation", group="Signal Settings")
+minPeakStrength = input.int(2, title="Minimum Peak Strength", minval=1, maxval=5, group="Signal Settings")
+
+// Visual Settings
+showSignals = input(true, "Show Signals", group="Visual Settings")
+showZones = input(true, title="Show Overbought/Oversold Zones", group="Visual Settings")
+showMiddleLine = input(true, title="Show Middle Line", group="Visual Settings")
+showMfiCloud = input(true, title="Show MFI Cloud", group="Visual Settings")
+
+// ========== CALCULATIONS ==========
+// RSI Calculation
+rsi = ta.rsi(src, rsiLength)
+smoothedRSI = ta.ema(rsi, 3)
+
+// MFI Calculation
+mfi = ta.mfi(close, mfiLength)
+fastMfi = ta.ema(mfi, fastMfiEma)
+slowMfi = ta.ema(mfi, slowMfiEma)
+
+// Cloud Conditions
+bullishCloud = fastMfi > slowMfi
+bearishCloud = fastMfi < slowMfi
+
+// Peak Detection
+isPeak = ta.falling(rsi, minPeakStrength) and rsi >= overbought
+isDip = ta.rising(rsi, minPeakStrength) and rsi <= oversold
+
+// Volume Filter
+volumeOk = not requireVolume or volume > ta.sma(volume, 20)
+
+// Trend Filter
+trendOkBuy = not trendConfirmation or close > ta.ema(close, 20)
+trendOkSell = not trendConfirmation or close < ta.ema(close, 20)
+
+// Crossover conditions
+crossOverSold = ta.crossover(rsi, oversold)
+crossUnderBought = ta.crossunder(rsi, overbought)
+
+// ========== SIGNAL GENERATION ==========
+// Track last signals
+var string lastSignal = "None"
+var color lastSignalColor = color.gray
+
+// Enhanced Buy Signal
+buySignal = showSignals and ((isDip and volumeOk and trendOkBuy and (ta.change(rsi, 1) > 0 and (ta.change(rsi, 2) > 0))) or 
+           (not requireVolume and not trendConfirmation and crossOverSold))
+
+// Enhanced Sell Signal
+sellSignal = showSignals and ((isPeak and volumeOk and trendOkSell and (ta.change(rsi, 1) < 0 and (ta.change(rsi, 2) < 0))) or             (not requireVolume and not trendConfirmation and crossUnderBought))
+
+var float buySignalBar = na
+var float buySignalClose = na
+
+var float sellSignalBar = na
+var float sellSignalClose = na
+
+// Update last signal
+if buySignal
+    lastSignal := "BUY"
+    lastSignalColor := color.green
+    
+    buySignalBar := bar_index
+    buySignalClose := close
+else if sellSignal
+    lastSignal := "SELL"
+    lastSignalColor := color.red
+
+    sellSignalBar := bar_index
+    sellSignalClose := close
+
+// =========== real buy ===========
+isSecondBuyBar = not na(buySignalBar) and bar_index == buySignalBar + 1
+isBullish = close > open
+isOpenLower = not na(buySignalClose) and open > buySignalClose * 0.99
+
+// 计算K线参数
+bodyBuy = math.abs(close - open)
+upperShadowBuy = high - math.max(close, open)
+lowerShadowBuy = math.min(close, open) - low
+totalLengthBuy = high - low
+
+isSmallBullishBody = isBullish and totalLengthBuy > 0 and
+     (bodyBuy / totalLengthBuy > 0.3) and
+     (lowerShadowBuy / bodyBuy < 1)
+
+finalBuy = isSecondBuyBar and isSmallBullishBody and isOpenLower
+
+
+// =========== real sell ===========
+isSecondSellBar = not na(sellSignalBar) and bar_index == sellSignalBar + 1
+isBearish = close < open
+isOpenHigher = not na(sellSignalClose) and open < sellSignalClose * 1.01
+
+bodySell = math.abs(close - open)
+upperShadowSell = high - math.max(close, open)
+lowerShadowSell = math.min(close, open) - low
+totalLengthSell = high - low
+
+isSmallBearishBody = isBearish and totalLengthSell > 0 and
+     (bodySell / totalLengthSell > 0.3) and
+     (upperShadowSell / bodySell < 1)
+
+finalSell = isSecondSellBar and isSmallBearishBody and isOpenHigher
+
+// ========== VISUAL ELEMENTS ==========
+// Dynamic RSI Coloring
+rsiColor = rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.new(#2962FF, 0)
+plot(rsi, title="RSI", color=rsiColor, linewidth=2)
+
+// MFI Cloud Between EMAs
+fillColor = bullishCloud ? color.new(color.green, 100-cloudOpacity) : bearishCloud ? color.new(color.red, 100-cloudOpacity) : na
+
+// Always plot (but conditionally display)
+fastPlot = plot(showMfiCloud ? fastMfi : na, title="Fast MFI EMA", color=color.new(color.blue, 0), linewidth=1, display=display.none)
+slowPlot = plot(showMfiCloud ? slowMfi : na, title="Slow MFI EMA", color=color.new(color.orange, 0), linewidth=1, display=display.none)
+
+// Fill between plots (will only show when showMfiCloud is true)
+fill(fastPlot, slowPlot, color=showMfiCloud ? fillColor : na, title="MFI Cloud")
+
+// Reference Lines
+hline(overbought, "Overbought", color=showZones ? color.new(#FF5252, 0) : na, linestyle=hline.style_dashed)
+hline(oversold, "Oversold", color=showZones ? color.new(#00C853, 0) : na, linestyle=hline.style_dashed)
+hline(50, "Middle Line", color=showMiddleLine ? color.new(#616161, 0) : na, linestyle=hline.style_dashed)
+
+// Signal Plotting - Adjusted positions for better visibility
+plotshape(buySignal ? oversold - 5 : na, title="Buy Signal", location=location.absolute, color=color.new(#00FF00, 50), 
+         style=shape.labelup, size=size.tiny)
+plotshape(finalBuy ? oversold - 10 : na, title="Final Buy Signal", location=location.absolute, color=color.new(#00FF00, 0), 
+         style=shape.labeldown, size=size.tiny)
+plotshape(sellSignal ? overbought + 5 : na, title="Sell Signal", location=location.absolute, color=color.new(#FF0000, 50),
+         style=shape.labeldown, size=size.tiny)
+plotshape(finalSell ? overbought + 10 : na, title="Final Sell Signal", location=location.absolute, color=color.new(#FF0000, 0),
+         style=shape.labeldown, size=size.tiny)
+
+// Zone Backgrounds
+bgcolor(showZones and rsi >= overbought ? color.new(#FF5252, 90) : na, title="Overbought Zone")
+bgcolor(showZones and rsi <= oversold ? color.new(#00C853, 90) : na, title="Oversold Zone")
+
+// ========== ALERTS ==========
+alertcondition(finalBuy, title="Buy Signal Alert", message="RSI Buy Signal at {{close}}")
+alertcondition(finalSell, title="Sell Signal Alert", message="RSI Sell Signal at {{close}}")
+
+// ========== INFO PANEL ==========
+var table infoTable = table.new(position.top_right, 2, 5, border_width=1, bgcolor=color.new(#2D3436, 90))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "RSI Value", text_color=color.gray)
+    table.cell(infoTable, 1, 0, str.tostring(rsi, "#.00"), 
+              text_color=rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.white)
+    
+    table.cell(infoTable, 0, 1, "MFI Trend", text_color=color.gray)
+    table.cell(infoTable, 1, 1, bullishCloud ? "Bullish" : bearishCloud ? "Bearish" : "Neutral",
+              text_color=bullishCloud ? color.green : bearishCloud ? color.red : color.gray)
+    
+    table.cell(infoTable, 0, 2, "Status", text_color=color.gray)
+    table.cell(infoTable, 1, 2, rsi >= overbought ? "Overbought" : rsi <= oversold ? "Oversold" : "Neutral",
+              text_color=rsi >= overbought ? color.red : rsi <= oversold ? color.green : color.white)
+    
+    table.cell(infoTable, 0, 3, "Last Signal", text_color=color.gray)
+    table.cell(infoTable, 1, 3, lastSignal, text_color=lastSignalColor)
+    
+    table.cell(infoTable, 0, 4, "Momentum", text_color=color.gray)
+    table.cell(infoTable, 1, 4, ta.change(rsi, 1) > 0 ? "Rising" : "Falling",
+              text_color=ta.change(rsi, 1) > 0 ? color.green : color.red)

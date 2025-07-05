@@ -129,6 +129,8 @@ def get_local_trading_day(now=None):
 def get_min_5_price():
     """Get the lowest price in the last 5 minutes."""
     lowest = None
+    if g_position_symbol is None:
+        return
     try:
         resp = quote_ctx.candlesticks(g_position_symbol, Period.Min_1, 5, AdjustType.NoAdjust, TradeSessions.Intraday)
         lows = [item.low for item in resp]

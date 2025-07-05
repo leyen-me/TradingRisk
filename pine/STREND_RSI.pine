@@ -1,0 +1,167 @@
+//@version=6
+indicator("STREND_RSI", overlay=true, shorttitle="STREND_RSI", precision=2, max_labels_count=500)
+
+// =============================================================================
+// RSI 指标设置部分
+// =============================================================================
+// RSI 基础参数设置
+rsiLength = input.int(14, title="RSI 周期", minval=1, maxval=100, group="RSI 设置")
+oversold = input.int(30, title="超卖水平", minval=0, maxval=100, group="RSI 设置")
+overbought = input.int(70, title="超买水平", minval=0, maxval=100, group="RSI 设置")
+src = input.source(close, title="数据源", group="RSI 设置")
+
+// 信号检测参数
+minPeakStrength = input.int(2, title="最小峰值强度", minval=1, maxval=5, group="信号设置")
+
+// 可视化显示控制
+showSignals = input.bool(true, title="显示信号", group="可视化设置")
+showZones = input.bool(true, title="显示超买/超卖区域", group="可视化设置")
+
+// =============================================================================
+// RSI 计算部分
+// =============================================================================
+// 计算 RSI 值
+rsi = ta.rsi(src, rsiLength)
+
+// 检测峰值和谷值
+isPeak = ta.falling(rsi, minPeakStrength) and rsi >= overbought  // 检测超买区域的峰值
+isDip = ta.rising(rsi, minPeakStrength) and rsi <= oversold      // 检测超卖区域的谷值
+
+// 检测穿越信号
+crossOverSold = ta.crossover(rsi, oversold)      // RSI 向上穿越超卖线
+crossUnderBought = ta.crossunder(rsi, overbought) // RSI 向下穿越超买线
+
+// =============================================================================
+// 信号生成和跟踪部分
+// =============================================================================
+// 初始化信号跟踪变量
+var string lastSignal = "无"
+var color lastSignalColor = color.gray
+
+// 生成买入和卖出信号
+buySignal = showSignals and ((isDip and (ta.change(rsi, 1) > 0 and (ta.change(rsi, 2) > 0))) or crossOverSold)
+sellSignal = showSignals and ((isPeak and (ta.change(rsi, 1) < 0 and (ta.change(rsi, 2) < 0))) or crossUnderBought)
+
+// 信号位置和价格记录变量
+var float buySignalBar = na
+var float buySignalClose = na
+var float sellSignalBar = na
+var float sellSignalClose = na
+
+// 更新信号状态和记录
+if buySignal
+    lastSignal := "买入"
+    lastSignalColor := color.green
+    buySignalBar := bar_index
+    buySignalClose := close
+else if sellSignal
+    lastSignal := "卖出"
+    lastSignalColor := color.red
+    sellSignalBar := bar_index
+    sellSignalClose := close
+
+// =============================================================================
+// 最终买入信号确认部分
+// =============================================================================
+// 检查是否为信号后的第二个K线
+isSecondBuyBar = not na(buySignalBar) and bar_index == buySignalBar + 1
+// 检查是否为阳线（收盘价高于开盘价）
+isBullish = close > open
+// 检查开盘价是否接近信号时的收盘价（允许1%的偏差）
+isOpenLower = not na(buySignalClose) and open > buySignalClose * 0.99
+
+// 计算K线形态参数
+bodyBuy = math.abs(close - open)                    // K线实体长度
+upperShadowBuy = high - math.max(close, open)       // 上影线长度
+lowerShadowBuy = math.min(close, open) - low        // 下影线长度
+totalLengthBuy = high - low                         // K线总长度
+
+// 判断是否为小阳线形态（实体占比大于30%，下影线小于实体）
+isSmallBullishBody = isBullish and totalLengthBuy > 0 and
+     (bodyBuy / totalLengthBuy > 0.3) and
+     (lowerShadowBuy / bodyBuy < 1)
+
+// 最终买入信号确认
+finalBuy = isSecondBuyBar and isSmallBullishBody and isOpenLower
+
+// =============================================================================
+// 最终卖出信号确认部分
+// =============================================================================
+// 检查是否为信号后的第二个K线
+isSecondSellBar = not na(sellSignalBar) and bar_index == sellSignalBar + 1
+// 检查是否为阴线（收盘价低于开盘价）
+isBearish = close < open
+// 检查开盘价是否接近信号时的收盘价（允许1%的偏差）
+isOpenHigher = not na(sellSignalClose) and open < sellSignalClose * 1.01
+
+// 计算K线形态参数
+bodySell = math.abs(close - open)                   // K线实体长度
+upperShadowSell = high - math.max(close, open)      // 上影线长度
+lowerShadowSell = math.min(close, open) - low       // 下影线长度
+totalLengthSell = high - low                        // K线总长度
+
+// 判断是否为小阴线形态（实体占比大于30%，上影线小于实体）
+isSmallBearishBody = isBearish and totalLengthSell > 0 and
+     (bodySell / totalLengthSell > 0.3) and
+     (upperShadowSell / bodySell < 1)
+
+// 最终卖出信号确认
+finalSell = isSecondSellBar and isSmallBearishBody and isOpenHigher
+
+// =============================================================================
+// 可视化绘制部分
+// =============================================================================
+// 绘制买入信号标记（半透明）
+plotshape(buySignal ? oversold - 10 : na, title="买入信号", location=location.belowbar, color=color.new(#00FF00, 50), style=shape.labelup, size=size.tiny)
+
+// 绘制最终买入信号标记（不透明）
+plotshape(finalBuy ? oversold - 10 : na, title="最终买入信号", location=location.belowbar, color=color.new(#00FF00, 0), style=shape.labelup, size=size.tiny)
+
+// 绘制卖出信号标记（半透明）
+plotshape(sellSignal ? overbought + 10 : na, title="卖出信号", location=location.abovebar, color=color.new(#FF0000, 50),style=shape.labeldown, size=size.tiny)
+
+// 绘制最终卖出信号标记（不透明）
+plotshape(finalSell ? overbought + 10 : na, title="最终卖出信号", location=location.abovebar, color=color.new(#FF0000, 0),style=shape.labeldown, size=size.tiny)
+
+// 绘制超买超卖区域背景
+bgcolor(showZones and rsi >= overbought ? color.new(#FF5252, 90) : na, title="超买区域")
+bgcolor(showZones and rsi <= oversold ? color.new(#00C853, 90) : na, title="超卖区域")
+
+// =============================================================================
+// 警报设置部分
+// =============================================================================
+alertcondition(finalBuy, title="买入信号警报", message="RSI 买入信号，收盘价 {{close}}")
+alertcondition(finalSell, title="卖出信号警报", message="RSI 卖出信号，收盘价 {{close}}")
+
+// =============================================================================
+// ATR 通道指标部分
+// =============================================================================
+// ATR 参数设置
+atrPeriods = input.int(10, title="ATR 周期", minval=1, group="ATR 设置")
+atrSource = input.source(hl2, title="ATR 数据源", group="ATR 设置")
+atrMultiplier = input.float(2.7, title="ATR 倍数", step=0.1, minval=0.1, group="ATR 设置")
+changeATR = input.bool(true, title="使用标准ATR计算方法", group="ATR 设置")
+showATRSignals = input.bool(true, title="显示ATR买卖信号", group="ATR 设置")
+highlighting = input.bool(true, title="启用高亮显示", group="ATR 设置")
+
+// ATR 计算
+atr2 = ta.sma(ta.tr, atrPeriods)  // 简单移动平均的ATR
+atr = changeATR ? ta.atr(atrPeriods) : atr2  // 选择ATR计算方法
+
+// 计算上轨和下轨
+up = atrSource - (atrMultiplier * atr)  // 上轨
+up1 = nz(up[1], up)  // 前一个上轨值
+up := close[1] > up1 ? math.max(up, up1) : up  // 更新上轨
+
+dn = atrSource + (atrMultiplier * atr)  // 下轨
+dn1 = nz(dn[1], dn)  // 前一个下轨值
+dn := close[1] < dn1 ? math.min(dn, dn1) : dn  // 更新下轨
+
+// 趋势判断
+trend = 1
+trend := nz(trend[1], trend)
+trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+
+// 绘制趋势线
+upPlot = plot(trend == 1 ? up : na, title="上升趋势", style=plot.style_linebr, linewidth=1, color=color.rgb(76, 175, 79, 50))
+dnPlot = plot(trend == 1 ? na : dn, title="下降趋势", style=plot.style_linebr, linewidth=1, color=color.rgb(255, 82, 82, 50))

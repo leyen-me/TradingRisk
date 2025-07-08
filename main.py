@@ -445,6 +445,7 @@ def webhook():
         validate_auth(data)
         symbol, action_enum = parse_webhook_data(data)
         update_us_stock_trading_hours()
+        validate_cooldown()
         validate_active_time()
         trade_option(symbol, action_enum)
         return jsonify({'code': 200, 'status': 'success'}), 200

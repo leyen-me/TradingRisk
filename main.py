@@ -179,7 +179,7 @@ def get_option_chain(symbol: str, expiry: date):
         logger.warning(f"Failed to fetch option chain: {e}")
     return []
 
-def select_strike_options(options, price: Decimal, window: int = 2):
+def select_strike_options(options, price: Decimal, window: int = 1):
     """Select options with strike prices within a window around the current price."""
     strikes = [item.price for item in options]
     if not strikes:

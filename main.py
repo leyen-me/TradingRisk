@@ -11,7 +11,7 @@ from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from longport.openapi import (
     Config, QuoteContext, TradeContext, PushOrderChanged, OrderType, OrderStatus,
-    OrderSide, TimeInForceType, TopicType, OutsideRTH, Period, AdjustType, TradeSessions
+    OrderSide, TimeInForceType, TopicType, OutsideRTH
 )
 
 # ================== Logging Config ==================
@@ -24,21 +24,11 @@ class Action(Enum):
     BUY = "buy"
     SELL = "sell"
 
-class Mode(Enum):
-    ETF = "etf"
-    OPTION = "option"
-
 # Environment variables
 LONGPORT_WEBHOOK_SECRET = os.getenv("LONGPORT_WEBHOOK_SECRET")
 CONFIG = Config.from_env()
 
 # Trading parameters
-ETF_MAP = {
-    "TSLA.US": "TSLL.US",
-    "MSTR.US": "MSTU.US"
-}
-ETF_PROFIT_RATIO = 0.03
-ETF_LOSS_RATIO = 0.015
 OPTION_PROFIT_RATIO = 0.06
 OPTION_LOSS_RATIO = 0.03
 OPEN_COOLDOWN_MINUTES = 10
@@ -52,7 +42,6 @@ US_MARKET_CLOSE_MINUTE = int(os.getenv("US_MARKET_CLOSE_MINUTE", 0))
 
 # ================== Global State ==================
 g_last_open_time = None
-g_position_mode = None
 g_position_symbol = None
 g_position_price = Decimal('0')
 g_position_stop_loss_price = Decimal('0')
@@ -63,10 +52,6 @@ g_position_quantity = Decimal('0')
 g_position_lock = threading.Lock()
 g_processed_order_ids = OrderedDict()
 g_pending_orders = {}
-
-g_today_trades = []
-g_today_date = None
-g_today_profit = False
 
 quote_ctx = QuoteContext(CONFIG)
 trade_ctx = TradeContext(CONFIG)
@@ -126,21 +111,6 @@ def get_local_trading_day(now=None):
     else:
         return (now - timedelta(days=1)).date()
 
-def get_min_5_price():
-    """Get the lowest price in the last 5 minutes."""
-    lowest = None
-    if g_position_symbol is None:
-        return
-    try:
-        resp = quote_ctx.candlesticks(g_position_symbol, Period.Min_1, 5, AdjustType.NoAdjust, TradeSessions.Intraday)
-        lows = [item.low for item in resp]
-        if lows:
-            lowest = min(lows)
-        logging.info(f"查询到最近20根K线的最低价:{str(lowest)}")
-    except Exception as e:
-        logger.warning(f"查询最低价失败: {e}")
-    return lowest
-
 def reset_position():
     """Reset all position-related global variables."""
     global g_position_symbol, g_position_price, g_position_quantity
@@ -162,66 +132,12 @@ def update_position(event: PushOrderChanged):
     g_last_open_time = datetime.now()
 
     # 计算止损和止盈价格
-    TAKE_PROFIT_RATIO = None
-    STOP_LOSS_RATIO = None
-    if g_position_mode == Mode.OPTION:
-        TAKE_PROFIT_RATIO = Decimal(str(1 + OPTION_PROFIT_RATIO))
-        STOP_LOSS_RATIO = Decimal(str(1 - OPTION_LOSS_RATIO))
-    elif g_position_mode == Mode.ETF:
-        TAKE_PROFIT_RATIO = Decimal(str(1 + ETF_PROFIT_RATIO))
-        STOP_LOSS_RATIO = Decimal(str(1 - ETF_LOSS_RATIO))
-    else:
-        raise ValueError(f"Invalid position mode: {g_position_mode}")
+    TAKE_PROFIT_RATIO = Decimal(str(1 + OPTION_PROFIT_RATIO))
+    STOP_LOSS_RATIO = Decimal(str(1 - OPTION_LOSS_RATIO))
     g_position_stop_loss_price = (g_position_price * STOP_LOSS_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
     g_position_take_profit_price = (g_position_price * TAKE_PROFIT_RATIO).quantize(PRICE_PRECISION, rounding=ROUND_DOWN)
 
-    # 如果最近5分钟最低价低于当前价格，则止损价格为最低价
-    lowest_price = get_min_5_price()
-    if lowest_price is not None:
-        if lowest_price < g_position_price:
-            g_position_stop_loss_price = lowest_price
-        else:
-            # 股价一直下跌，没有最低价
-            pass
-
-def reset_daily_trade_state():
-    global g_today_trades, g_today_date, g_today_profit
-    today = get_local_trading_day()
-    if g_today_date != today:
-        g_today_trades = []
-        g_today_profit = False
-        g_today_date = today
-
-def add_today_trade(event: PushOrderChanged):
-    """Add a new trade to today's trades."""
-    global g_today_trades
-    if g_position_mode == Mode.OPTION:
-        g_today_trades.append({'buy': event.submitted_price})
-    elif g_position_mode == Mode.ETF:
-        g_today_trades.append({'buy': event.submitted_price})
-    else:
-        raise ValueError(f"Invalid position mode: {g_position_mode}")
-
-def update_today_trades(event: PushOrderChanged):
-    """Update today's trades."""
-    global g_today_trades, g_today_profit
-    if len(g_today_trades) > 0:
-        g_today_trades[-1]['sell'] = event.submitted_price
-        g_today_trades[-1]['profit'] = event.submitted_price >= g_today_trades[-1]['buy']
-        if g_today_trades[-1]['profit']:
-            g_today_profit = True
-
-def can_trade() -> bool:
-    reset_daily_trade_state()
-    # If already profitable today, do not trade
-    if g_today_profit:
-        return False
-    # If already traded twice today, do not trade
-    if len(g_today_trades) >= 2:
-        return False
-    return True
-
-def get_current_price(action: Action, symbol: str) -> Optional[float]:
+def get_current_price(action: Action, symbol: str) -> Optional[Decimal]:
     """Get the current best ask/bid price for the given symbol."""
     try:
         resp = quote_ctx.depth(symbol)
@@ -234,7 +150,7 @@ def get_current_price(action: Action, symbol: str) -> Optional[float]:
         logger.warning(f"Failed to fetch market depth: {e}")
     return None
 
-def get_latest_price(symbol: str) -> Optional[float]:
+def get_latest_price(symbol: str) -> Optional[Decimal]:
     """Get the latest traded price for the symbol."""
     try:
         price_resp = quote_ctx.quote([symbol])
@@ -263,7 +179,7 @@ def get_option_chain(symbol: str, expiry: date):
         logger.warning(f"Failed to fetch option chain: {e}")
     return []
 
-def select_strike_options(options, price: float, window: int = 2):
+def select_strike_options(options, price: Decimal, window: int = 2):
     """Select options with strike prices within a window around the current price."""
     strikes = [item.price for item in options]
     if not strikes:
@@ -272,12 +188,16 @@ def select_strike_options(options, price: float, window: int = 2):
     indices = range(max(0, closest_idx - window), min(len(strikes), closest_idx + window + 1))
     return [options[i] for i in indices]
 
-def choose_option_contract(selected_options):
+def choose_option_contract(selected_options, action: Action):
     """Choose the best option contract based on action."""
     if not selected_options:
         return None, None
-    chosen = max(selected_options, key=lambda x: x.price)
-    return chosen.call_symbol, chosen.price
+    if action == Action.BUY:
+        chosen = max(selected_options, key=lambda x: x.price)
+        return chosen.call_symbol, chosen.price
+    else:
+        chosen = min(selected_options, key=lambda x: x.price)
+        return chosen.put_symbol, chosen.price
 
 def validate_auth(data):
     """Validate webhook token."""
@@ -288,12 +208,12 @@ def validate_auth(data):
 def parse_webhook_data(data):
     """Parse and validate webhook data."""
     ticker = data.get('ticker')
-    mode = data.get('mode', 'option')
+    action = data.get('action', 'buy')
     try:
-        mode_enum = Mode(mode)
+        action_enum = Action(action)
     except ValueError:
-        raise ValueError(f"Invalid mode: {mode}")
-    return ticker, mode_enum
+        raise ValueError(f"Invalid action: {action}")
+    return ticker, action_enum
 
 def is_weekend(dt: datetime) -> bool:
     """Check if the given datetime is a weekend."""
@@ -311,14 +231,14 @@ def get_trading_session(dt: datetime):
         return None, None
     return open_time, close_time
 
-def validate_active_time(active_time: datetime = None):
+def validate_active_time():
     """
     Only allow trading during active session.
     - No trading after 21:30 on Friday (risk of not being able to close position).
     - No trading on weekends.
     - Only allow trading during US night session (21:30-04:00), with a buffer.
     """
-    dt = active_time or datetime.now()
+    dt = datetime.now()
     if dt.weekday() == 4 and dt.hour >= US_MARKET_OPEN_HOUR:
         raise Exception("No trading after 21:30 on Friday.")
     if is_weekend(dt):
@@ -327,9 +247,8 @@ def validate_active_time(active_time: datetime = None):
     if not open_time or not close_time:
         raise Exception("Not in US trading session.")
 
-    # No trading shall be permitted within the first 30 minutes after the market opens and within the last 30 minutes before the market closes.
-    allow_start = open_time + timedelta(minutes=30)
-    allow_end = close_time - timedelta(minutes=30)
+    allow_start = open_time
+    allow_end = close_time - timedelta(minutes=60)
     if not (allow_start <= dt <= allow_end):
         raise Exception("Not in allowed trading time window.")
 
@@ -341,7 +260,6 @@ def validate_cooldown():
         if delta < OPEN_COOLDOWN_SECONDS:
             raise Exception(f"Cooldown not finished. {delta:.0f}s since last open.")
 
-# ================== Trading Logic ==================
 def submit_option_order(symbol: str, action: Action):
     """Submit an option order."""
     try:
@@ -370,46 +288,7 @@ def submit_option_order(symbol: str, action: Action):
     except Exception as e:
         logger.error(f"Order submission failed: {e}")
 
-def submit_etf_order(symbol: str, action: Action):
-    """Submit an ETF order."""
-    try:
-        price = get_current_price(action, symbol)
-        if price is None:
-            logger.warning("No option price available.")
-            return
-        max_buy_resp = trade_ctx.estimate_max_purchase_quantity(
-            symbol=symbol,
-            order_type=OrderType.LO,
-            side=OrderSide.Buy,
-            price=price
-        )
-        if int(max_buy_resp.cash_max_qty) == 0:
-            raise Exception("Insufficient cash.")
-        
-        order = trade_ctx.submit_order(
-            symbol,
-            OrderType.LO,
-            OrderSide.Buy,
-            Decimal(int(max_buy_resp.cash_max_qty)),
-            TimeInForceType.GoodTilCanceled,
-            submitted_price=price
-        )
-        g_pending_orders[order.order_id] = (datetime.now(), symbol)
-        logger.info(f"Order submitted: {symbol}, qty: {max_buy_resp.cash_max_qty}")
-    except Exception as e:
-        logger.error(f"Order submission failed: {e}")
-
-def trade_etf(symbol: str):
-    """Trade ETF."""
-    etf_symbol = None
-    try:
-        etf_symbol = ETF_MAP[symbol]
-    except KeyError:
-        logger.warning(f"Invalid ETF symbol: {symbol}")
-        return
-    submit_etf_order(etf_symbol, Action.BUY)
-
-def trade_option(symbol: str, window: int = 2):
+def trade_option(symbol: str, action: Action, window: int = 2):
     """Main trading flow: select and submit option order."""
     price = get_latest_price(symbol)
     if price is None:
@@ -426,7 +305,7 @@ def trade_option(symbol: str, window: int = 2):
     selected_options = select_strike_options(options, price, window)
     for opt in selected_options:
         logger.info(f"Strike: {opt.price}, Call: {opt.call_symbol}, Put: {opt.put_symbol}")
-    chosen_symbol, strike_price = choose_option_contract(selected_options)
+    chosen_symbol, strike_price = choose_option_contract(selected_options, action)
     if not chosen_symbol:
         logger.warning("No suitable option contract selected.")
         return
@@ -436,6 +315,8 @@ def trade_option(symbol: str, window: int = 2):
 def set_position_risk():
     """Set stop loss and take profit orders for the current position."""
     global g_stop_order_id, g_take_profit_order_id
+    if g_position_symbol is None:
+        return
     try:
         stop_order = trade_ctx.submit_order(
             g_position_symbol,
@@ -483,13 +364,8 @@ def cancel_risk_orders():
     finally:
         g_take_profit_order_id = None
 
-def log_today_trades():
-    """Log today's trades."""
-    logger.info(f"Today's trades: {g_today_trades}")
-
 def auto_close_position():
     """Automatically close position at scheduled time."""
-    log_today_trades()
     if g_position_symbol is None:
         logger.info("No position to close.")
         return
@@ -522,17 +398,6 @@ def check_pending_orders():
     for order_id in to_cancel:
         g_pending_orders.pop(order_id, None)
 
-def trade(symbol: str, mode: Mode):
-    if not can_trade():
-        logger.info("Today's trading conditions are not met. Order placement is rejected.")
-        return
-    if mode == Mode.OPTION:
-        trade_option(symbol)
-    elif mode == Mode.ETF:
-        trade_etf(symbol)
-    else:
-        raise ValueError(f"Invalid mode: {mode}")
-
 def on_order_changed(event: PushOrderChanged):
     """Order change callback, thread-safe."""
     with g_position_lock:
@@ -549,14 +414,12 @@ def on_order_changed(event: PushOrderChanged):
                 if g_position_symbol is None:
                     logger.info(f"Buy order filled: {event.symbol}")
                     
-                    add_today_trade(event)
                     update_position(event)
                     set_position_risk()
             elif event.side == OrderSide.Sell:
                 if g_position_symbol is not None:
                     logger.info(f"Sell order filled: {g_position_symbol}")
 
-                    update_today_trades(event)
                     reset_position()
                     cancel_risk_orders()
 
@@ -572,20 +435,18 @@ def webhook():
     Expected JSON:
     {
         "ticker": "TSLA.US",
-        "mode": "option/etf",
+        "action": "buy/sell",
         "token": "xxx"
     }
     """
-    global g_position_mode
     try:
         data = request.json
         logger.info(f"Received webhook: {data}")
         validate_auth(data)
-        symbol, mode_enum = parse_webhook_data(data)
+        symbol, action_enum = parse_webhook_data(data)
         update_us_stock_trading_hours()
         validate_active_time()
-        g_position_mode = mode_enum
-        trade(symbol, mode_enum)
+        trade_option(symbol, action_enum)
         return jsonify({'code': 200, 'status': 'success'}), 200
     except ValueError as ve:
         logger.warning(f"Parameter error: {ve}")

@@ -247,7 +247,7 @@ def validate_active_time():
     if not open_time or not close_time:
         raise Exception("Not in US trading session.")
 
-    allow_start = open_time
+    allow_start = open_time + timedelta(minutes=30)
     allow_end = close_time - timedelta(minutes=60)
     if not (allow_start <= dt <= allow_end):
         raise Exception("Not in allowed trading time window.")

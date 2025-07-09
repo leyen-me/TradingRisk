@@ -441,6 +441,7 @@ def webhook():
     """
     try:
         data = request.json
+        logger.info('=========================new order===========================')
         logger.info(f"Received webhook: {data}")
         validate_auth(data)
         symbol, action_enum = parse_webhook_data(data)
